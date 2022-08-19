@@ -105,7 +105,7 @@ impl<'tcx> Queries<'tcx> {
         }
     }
 
-    fn session(&self) -> &Lrc<Session> {
+    pub fn session(&self) -> &Lrc<Session> {
         &self.compiler.sess
     }
     fn codegen_backend(&self) -> &Lrc<Box<dyn CodegenBackend>> {

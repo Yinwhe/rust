@@ -39,6 +39,7 @@ use rustc_session::{early_error, early_error_no_abort, early_warn};
 use rustc_span::source_map::{FileLoader, FileName};
 use rustc_span::symbol::sym;
 use rustc_target::json::ToJson;
+use rustc_expand::config::ConfigFeatures;
 
 use std::borrow::Cow;
 use std::cmp::max;
@@ -345,6 +346,11 @@ fn run_compiler(
                 return early_exit();
             }
 
+            if sess.opts.nft_analysis {
+                my_plugin(queries);
+                return early_exit();
+            }
+
             {
                 let (_, lint_store) = &*queries.register_plugins()?.peek();
 
@@ -427,6 +433,15 @@ fn run_compiler(
 
         Ok(())
     })
+}
+
+fn my_plugin(queries: &Queries<'_>) {
+    println!("||| Nightly Feature Analysis |||");
+
+    let krate = queries.parse().unwrap().take();
+    let mut config_features = ConfigFeatures { sess: queries.session(), cfg_features: Vec::new() };
+
+    config_features.analysis_krate_attrs(krate.attrs);
 }
 
 #[cfg(unix)]

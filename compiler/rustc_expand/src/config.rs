@@ -6,7 +6,7 @@ use rustc_ast::tokenstream::{AttrAnnotatedTokenStream, AttrAnnotatedTokenTree};
 use rustc_ast::tokenstream::{DelimSpan, Spacing};
 use rustc_ast::tokenstream::{LazyTokenStream, TokenTree};
 use rustc_ast::NodeId;
-use rustc_ast::{self as ast, AttrStyle, Attribute, HasAttrs, HasTokens, MetaItem};
+use rustc_ast::{self as ast, AttrStyle, Attribute, HasAttrs, HasTokens, MetaItem, AttrKind, MacArgs};
 use rustc_attr as attr;
 use rustc_data_structures::fx::FxHashMap;
 use rustc_data_structures::map_in_place::MapInPlace;
@@ -31,6 +31,120 @@ pub struct StripUnconfigured<'a> {
     /// which needs eager expansion of `cfg` and `cfg_attr`
     pub config_tokens: bool,
     pub lint_node_id: NodeId,
+}
+
+
+pub struct ConfigFeatures<'a> {
+    pub sess: &'a Session,
+    pub cfg_features: Vec<(Vec<MetaItem>, String)>,
+}
+
+impl<'a> ConfigFeatures<'a> {
+    pub fn analysis_krate_attrs(&mut self, attrs: Vec<ast::Attribute>) {
+        for attr in attrs {
+            self._analysis(attr, vec![]);
+        }
+
+        println!("{:#?}", self.cfg_features);
+    }
+
+    fn _analysis(&mut self, attr: Attribute, mut meta: Vec<MetaItem>) {
+        if attr.has_name(sym::cfg_attr) {
+            let Some((cfg_predicate, expanded_attrs)) =
+                rustc_parse::parse_cfg_attr(&attr, &self.sess.parse_sess) else {
+                    return;
+                };
+
+            expanded_attrs
+                .into_iter()
+                .map(|item| {
+                    let cfg_predicate = cfg_predicate.clone();
+                    
+                    // TODO: meta visulize
+                    meta.push(cfg_predicate);
+                    self._analysis(self.expand_cfg_attr_item(&attr, item), meta.clone());
+                })
+                .count();
+        } else if attr.has_name(sym::feature) {
+            // TODO: error processing
+            if let AttrKind::Normal(item) = attr.kind {
+                if let MacArgs::Delimited(_, _, tokens) = &item.item.args {
+                    for token in tokens.trees() {
+                        if let TokenTree::Token(token, _) = token {
+                            if let Some((ident, _)) = token.ident() {
+                                self.assign((meta.clone(), ident.as_str().to_string()));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    fn assign(&mut self, item: (Vec<MetaItem>, String)) {
+        self.cfg_features.push(item);
+    }
+
+    fn expand_cfg_attr_item(
+        &self,
+        attr: &Attribute,
+        (item, item_span): (ast::AttrItem, Span),
+    ) -> Attribute {
+        let orig_tokens = attr.tokens().to_tokenstream();
+
+        // We are taking an attribute of the form `#[cfg_attr(pred, attr)]`
+        // and producing an attribute of the form `#[attr]`. We
+        // have captured tokens for `attr` itself, but we need to
+        // synthesize tokens for the wrapper `#` and `[]`, which
+        // we do below.
+
+        // Use the `#` in `#[cfg_attr(pred, attr)]` as the `#` token
+        // for `attr` when we expand it to `#[attr]`
+        let mut orig_trees = orig_tokens.into_trees();
+        let TokenTree::Token(pound_token @ Token { kind: TokenKind::Pound, .. }, _) = orig_trees.next().unwrap() else {
+            panic!("Bad tokens for attribute {:?}", attr);
+        };
+        let pound_span = pound_token.span;
+
+        let mut trees = vec![(AttrAnnotatedTokenTree::Token(pound_token), Spacing::Alone)];
+        if attr.style == AttrStyle::Inner {
+            // For inner attributes, we do the same thing for the `!` in `#![some_attr]`
+            let TokenTree::Token(bang_token @ Token { kind: TokenKind::Not, .. }, _) = orig_trees.next().unwrap() else {
+                panic!("Bad tokens for attribute {:?}", attr);
+            };
+            trees.push((AttrAnnotatedTokenTree::Token(bang_token), Spacing::Alone));
+        }
+        // We don't really have a good span to use for the synthesized `[]`
+        // in `#[attr]`, so just use the span of the `#` token.
+        let bracket_group = AttrAnnotatedTokenTree::Delimited(
+            DelimSpan::from_single(pound_span),
+            Delimiter::Bracket,
+            item.tokens
+                .as_ref()
+                .unwrap_or_else(|| panic!("Missing tokens for {:?}", item))
+                .create_token_stream(),
+        );
+        trees.push((bracket_group, Spacing::Alone));
+        let tokens = Some(LazyTokenStream::new(AttrAnnotatedTokenStream::new(trees)));
+        let attr = attr::mk_attr_from_item(item, tokens, attr.style, item_span);
+        if attr.has_name(sym::crate_type) {
+            self.sess.parse_sess.buffer_lint(
+                rustc_lint_defs::builtin::DEPRECATED_CFG_ATTR_CRATE_TYPE_NAME,
+                attr.span,
+                ast::CRATE_NODE_ID,
+                "`crate_type` within an `#![cfg_attr] attribute is deprecated`",
+            );
+        }
+        if attr.has_name(sym::crate_name) {
+            self.sess.parse_sess.buffer_lint(
+                rustc_lint_defs::builtin::DEPRECATED_CFG_ATTR_CRATE_TYPE_NAME,
+                attr.span,
+                ast::CRATE_NODE_ID,
+                "`crate_name` within an `#![cfg_attr] attribute is deprecated`",
+            );
+        }
+        attr
+    }
 }
 
 fn get_features(

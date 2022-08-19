@@ -210,6 +210,9 @@ top_level_options!(
 
         /// The (potentially remapped) working directory
         working_dir: RealFileName [TRACKED],
+
+        /// For our nightly features analysis
+        nft_analysis: bool [UNTRACKED],
     }
 );
 
