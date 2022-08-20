@@ -6,7 +6,10 @@ use rustc_ast::tokenstream::{AttrAnnotatedTokenStream, AttrAnnotatedTokenTree};
 use rustc_ast::tokenstream::{DelimSpan, Spacing};
 use rustc_ast::tokenstream::{LazyTokenStream, TokenTree};
 use rustc_ast::NodeId;
-use rustc_ast::{self as ast, AttrStyle, Attribute, HasAttrs, HasTokens, MetaItem, AttrKind, MacArgs};
+use rustc_ast::{
+    self as ast, AttrKind, AttrStyle, Attribute, HasAttrs, HasTokens, MacArgs, MetaItem,
+    MetaItemKind, NestedMetaItem,
+};
 use rustc_attr as attr;
 use rustc_data_structures::fx::FxHashMap;
 use rustc_data_structures::map_in_place::MapInPlace;
@@ -33,10 +36,10 @@ pub struct StripUnconfigured<'a> {
     pub lint_node_id: NodeId,
 }
 
-
 pub struct ConfigFeatures<'a> {
     pub sess: &'a Session,
-    pub cfg_features: Vec<(Vec<MetaItem>, String)>,
+    pub origin_cfg_attrs_datas: Vec<(Vec<MetaItem>, Attribute)>,
+    pub processed_cfg_attrs_datas: Vec<(Vec<String>, String)>,
 }
 
 impl<'a> ConfigFeatures<'a> {
@@ -44,11 +47,42 @@ impl<'a> ConfigFeatures<'a> {
         for attr in attrs {
             self._analysis(attr, vec![]);
         }
+        // println!("origin: {:#?}", self.origin_cfg_attrs_datas);
 
-        println!("{:#?}", self.cfg_features);
+        self.process_analysis_result();
+        println!("processed: {:#?}", self.processed_cfg_attrs_datas);
     }
 
-    fn _analysis(&mut self, attr: Attribute, mut meta: Vec<MetaItem>) {
+    pub fn process_analysis_result(&mut self) {
+        let mut items = vec![];
+
+        for (conds, attr) in &self.origin_cfg_attrs_datas {
+            if !attr.has_name(sym::feature) {
+                continue;
+            }
+
+            let pro_conds: Vec<String> =
+                conds.iter().map(|cond| self.process_cfg_cond(cond)).collect();
+
+            if let AttrKind::Normal(item) = &attr.kind {
+                if let MacArgs::Delimited(_, _, tokens) = &item.item.args {
+                    for token in tokens.trees() {
+                        if let TokenTree::Token(token, _) = token {
+                            if let Some((ident, _)) = token.ident() {
+                                items.push((pro_conds.clone(), ident.as_str().to_string()));
+                            }
+                        }
+                    }
+                }
+            };
+        }
+
+        items.into_iter().map(|item| self.assign_pro(item)).count();
+    }
+
+    fn _analysis(&mut self, attr: Attribute, meta: Vec<MetaItem>) {
+        // println!("[Debug] attr: {:#?}, meta: {:#?}", &attr, &meta);
+
         if attr.has_name(sym::cfg_attr) {
             let Some((cfg_predicate, expanded_attrs)) =
                 rustc_parse::parse_cfg_attr(&attr, &self.sess.parse_sess) else {
@@ -59,30 +93,49 @@ impl<'a> ConfigFeatures<'a> {
                 .into_iter()
                 .map(|item| {
                     let cfg_predicate = cfg_predicate.clone();
-                    
-                    // TODO: meta visulize
+                    let mut meta = meta.clone();
+
                     meta.push(cfg_predicate);
-                    self._analysis(self.expand_cfg_attr_item(&attr, item), meta.clone());
+                    self._analysis(self.expand_cfg_attr_item(&attr, item), meta);
                 })
                 .count();
-        } else if attr.has_name(sym::feature) {
-            // TODO: error processing
-            if let AttrKind::Normal(item) = attr.kind {
-                if let MacArgs::Delimited(_, _, tokens) = &item.item.args {
-                    for token in tokens.trees() {
-                        if let TokenTree::Token(token, _) = token {
-                            if let Some((ident, _)) = token.ident() {
-                                self.assign((meta.clone(), ident.as_str().to_string()));
-                            }
-                        }
-                    }
-                }
-            }
+        } else {
+            self.assign_ori((meta.clone(), attr));
         }
     }
 
-    fn assign(&mut self, item: (Vec<MetaItem>, String)) {
-        self.cfg_features.push(item);
+    fn assign_ori(&mut self, item: (Vec<MetaItem>, Attribute)) {
+        self.origin_cfg_attrs_datas.push(item);
+    }
+
+    fn assign_pro(&mut self, item: (Vec<String>, String)) {
+        self.processed_cfg_attrs_datas.push(item);
+    }
+
+    fn process_cfg_cond(&self, cond: &MetaItem) -> String {
+        let req = match &cond.kind {
+            MetaItemKind::Word => cond.ident().unwrap().as_str().to_string(),
+            MetaItemKind::NameValue(lit) => {
+                format!("{} = {}", cond.ident().unwrap().as_str(), lit.token_lit.symbol.as_str(),)
+            }
+            MetaItemKind::List(nmetas) => {
+                let mut req = String::new();
+
+                for nmeta in nmetas {
+                    match nmeta {
+                        NestedMetaItem::MetaItem(meta) => {
+                            req.push_str(&self.process_cfg_cond(meta));
+                            req.push_str(",")
+                        }
+                        _ => unimplemented!(),
+                    }
+                }
+                req.pop();
+                format!("{}({})", cond.ident().unwrap().as_str(), req)
+            }
+        };
+
+        req
     }
 
     fn expand_cfg_attr_item(
