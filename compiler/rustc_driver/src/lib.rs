@@ -436,7 +436,7 @@ fn run_compiler(
 }
 
 fn my_plugin(queries: &Queries<'_>) {
-    println!("||| Nightly Feature Analysis |||");
+    println!("||| Nightly Feature Analysis Start |||");
 
     let krate = queries.parse().unwrap().take();
     let mut config_features = ConfigFeatures {
@@ -446,6 +446,8 @@ fn my_plugin(queries: &Queries<'_>) {
     };
 
     config_features.analysis_krate_attrs(krate.attrs);
+    config_features.print_processed();
+    println!("||| Nightly Feature Analysis End |||");
 }
 
 #[cfg(unix)]

@@ -47,10 +47,17 @@ impl<'a> ConfigFeatures<'a> {
         for attr in attrs {
             self._analysis(attr, vec![]);
         }
-        // println!("origin: {:#?}", self.origin_cfg_attrs_datas);
 
         self.process_analysis_result();
-        println!("processed: {:#?}", self.processed_cfg_attrs_datas);
+    }
+
+    pub fn print_processed(&self) {
+        self.processed_cfg_attrs_datas
+            .iter()
+            .map(|(conds, feat)| {
+                println!("([{}], {})", conds.join(","), feat);
+            })
+            .count();
     }
 
     pub fn process_analysis_result(&mut self) {
@@ -73,8 +80,12 @@ impl<'a> ConfigFeatures<'a> {
                             }
                         }
                     }
+                } else {
+                    panic!("rustc resolve feature fails");
                 }
-            };
+            } else {
+                panic!("rustc resolve feature fails");
+            }
         }
 
         items.into_iter().map(|item| self.assign_pro(item)).count();
@@ -114,9 +125,9 @@ impl<'a> ConfigFeatures<'a> {
 
     fn process_cfg_cond(&self, cond: &MetaItem) -> String {
         let req = match &cond.kind {
-            MetaItemKind::Word => cond.ident().unwrap().as_str().to_string(),
+            MetaItemKind::Word => cond.ident().expect("rustc resolve feature fails").as_str().to_string(),
             MetaItemKind::NameValue(lit) => {
-                format!("{} = {}", cond.ident().unwrap().as_str(), lit.token_lit.symbol.as_str(),)
+                format!("{} = {}", cond.ident().expect("rustc resolve feature fails").as_str(), lit.token_lit.symbol.as_str(),)
             }
             MetaItemKind::List(nmetas) => {
                 let mut req = String::new();
@@ -127,11 +138,11 @@ impl<'a> ConfigFeatures<'a> {
                             req.push_str(&self.process_cfg_cond(meta));
                             req.push_str(",")
                         }
-                        _ => unimplemented!(),
+                        _ => panic!("rustc resolve feature fails"),
                     }
                 }
                 req.pop();
-                format!("{}({})", cond.ident().unwrap().as_str(), req)
+                format!("{}({})", cond.ident().expect("rustc resolve feature fails").as_str(), req)
             }
         };
 
