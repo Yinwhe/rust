@@ -62,21 +62,27 @@ impl<'a> ConfigFeatures<'a> {
 
     pub fn process_analysis_result(&mut self) {
         let mut items = vec![];
+        let mut pro_conds = vec![vec![]];
 
         for (conds, attr) in &self.origin_cfg_attrs_datas {
             if !attr.has_name(sym::feature) {
                 continue;
             }
 
-            let pro_conds: Vec<String> =
-                conds.iter().map(|cond| self.process_cfg_cond(cond)).collect();
+            for cond in conds {
+                let tmp = self.process_cfg_cond(cond);
+                println!("[debug] {:?}", tmp);
+                pro_conds = vec_mul(pro_conds, tmp.into_iter().map(|s| vec![s]).collect());
+            }
+
+            // TODO: deal wtih pro_conds
 
             if let AttrKind::Normal(item) = &attr.kind {
                 if let MacArgs::Delimited(_, _, tokens) = &item.item.args {
                     for token in tokens.trees() {
                         if let TokenTree::Token(token, _) = token {
                             if let Some((ident, _)) = token.ident() {
-                                items.push((pro_conds.clone(), ident.as_str().to_string()));
+                                items.push(ident.as_str().to_string());
                             }
                         }
                     }
@@ -88,7 +94,16 @@ impl<'a> ConfigFeatures<'a> {
             }
         }
 
-        items.into_iter().map(|item| self.assign_pro(item)).count();
+        items
+            .into_iter()
+            .map(|feat| {
+                pro_conds
+                    .clone()
+                    .into_iter()
+                    .map(|conds| self.assign_pro((conds, feat.clone())))
+                    .count()
+            })
+            .count();
     }
 
     fn _analysis(&mut self, attr: Attribute, meta: Vec<MetaItem>) {
@@ -123,26 +138,34 @@ impl<'a> ConfigFeatures<'a> {
         self.processed_cfg_attrs_datas.push(item);
     }
 
-    fn process_cfg_cond(&self, cond: &MetaItem) -> String {
+    fn process_cfg_cond(&self, cond: &MetaItem) -> Vec<String> {
+        let left_val = cond.ident().expect("rustc resolve feature fails").as_str().to_string();
+
         let req = match &cond.kind {
-            MetaItemKind::Word => cond.ident().expect("rustc resolve feature fails").as_str().to_string(),
+            MetaItemKind::Word => vec![left_val],
             MetaItemKind::NameValue(lit) => {
-                format!("{} = {}", cond.ident().expect("rustc resolve feature fails").as_str(), lit.token_lit.symbol.as_str(),)
+                vec![format!("{} = {}", &left_val, lit.token_lit.symbol.as_str())]
             }
             MetaItemKind::List(nmetas) => {
-                let mut req = String::new();
+                let mut nest_conds = vec![vec![]];
 
                 for nmeta in nmetas {
                     match nmeta {
                         NestedMetaItem::MetaItem(meta) => {
-                            req.push_str(&self.process_cfg_cond(meta));
-                            req.push_str(",")
+                            nest_conds = vec_mul(
+                                nest_conds,
+                                self.process_cfg_cond(meta).into_iter().map(|s| vec![s]).collect(),
+                            );
                         }
                         _ => panic!("rustc resolve feature fails"),
                     }
                 }
-                req.pop();
-                format!("{}({})", cond.ident().expect("rustc resolve feature fails").as_str(), req)
+
+                if left_val.as_str() == "any" {
+                    nest_conds.into_iter().flatten().collect()
+                } else {
+                    nest_conds.into_iter().map(|conds| format!("{}({})",left_val, conds.join(","))).collect()
+                }
             }
         };
 
@@ -209,6 +232,26 @@ impl<'a> ConfigFeatures<'a> {
         }
         attr
     }
+}
+
+fn vec_mul<T: Clone>(a: Vec<Vec<T>>, b: Vec<Vec<T>>) -> Vec<Vec<T>> {
+    if a.is_empty() || b.is_empty() {
+        panic!("rustc resolve feature fails");
+    }
+
+    a.into_iter()
+        .map(|item1| {
+            b.clone()
+                .into_iter()
+                .map(|item2| {
+                    let mut t = item1.clone();
+                    t.extend(item2);
+                    t
+                })
+                .collect::<Vec<Vec<T>>>()
+        })
+        .flatten()
+        .collect()
 }
 
 fn get_features(
