@@ -62,9 +62,11 @@ impl<'a> ConfigFeatures<'a> {
 
     pub fn process_analysis_result(&mut self) {
         let mut items = vec![];
-        let mut pro_conds = vec![vec![]];
 
         for (conds, attr) in &self.origin_cfg_attrs_datas {
+            let mut pro_conds = vec![vec![]];
+            let mut pro_feats = vec![];
+
             if !attr.has_name(sym::feature) {
                 continue;
             }
@@ -79,7 +81,7 @@ impl<'a> ConfigFeatures<'a> {
                     for token in tokens.trees() {
                         if let TokenTree::Token(token, _) = token {
                             if let Some((ident, _)) = token.ident() {
-                                items.push(ident.as_str().to_string());
+                                pro_feats.push(ident.name.to_string());
                             }
                         }
                     }
@@ -89,23 +91,23 @@ impl<'a> ConfigFeatures<'a> {
             } else {
                 panic!("rustc resolve feature fails");
             }
+
+            pro_feats
+                .into_iter()
+                .map(|feat| {
+                    pro_conds
+                        .clone()
+                        .into_iter()
+                        .map(|conds| items.push((conds, feat.clone())))
+                        .count()
+                })
+                .count();
         }
 
-        items
-            .into_iter()
-            .map(|feat| {
-                pro_conds
-                    .clone()
-                    .into_iter()
-                    .map(|conds| self.assign_pro((conds, feat.clone())))
-                    .count()
-            })
-            .count();
+        items.into_iter().map(|item| self.assign_pro(item)).count();
     }
 
     fn _analysis(&mut self, attr: Attribute, meta: Vec<MetaItem>) {
-        // println!("[Debug] attr: {:#?}, meta: {:#?}", &attr, &meta);
-
         if attr.has_name(sym::cfg_attr) {
             let Some((cfg_predicate, expanded_attrs)) =
                 rustc_parse::parse_cfg_attr(&attr, &self.sess.parse_sess) else {
