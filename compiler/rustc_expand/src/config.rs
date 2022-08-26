@@ -71,13 +71,8 @@ impl<'a> ConfigFeatures<'a> {
 
             for cond in conds {
                 let tmp = self.process_cfg_cond(cond);
-                println!("[debug] tmp: {:?}", tmp);
                 pro_conds = vec_mul(pro_conds, tmp.into_iter().map(|s| vec![s]).collect());
             }
-
-            println!("[debug] pro_conds: {:?}", pro_conds);
-
-            // TODO: deal wtih pro_conds
 
             if let AttrKind::Normal(item) = &attr.kind {
                 if let MacArgs::Delimited(_, _, tokens) = &item.item.args {
