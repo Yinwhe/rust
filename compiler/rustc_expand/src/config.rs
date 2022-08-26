@@ -71,9 +71,11 @@ impl<'a> ConfigFeatures<'a> {
 
             for cond in conds {
                 let tmp = self.process_cfg_cond(cond);
-                println!("[debug] {:?}", tmp);
+                println!("[debug] tmp: {:?}", tmp);
                 pro_conds = vec_mul(pro_conds, tmp.into_iter().map(|s| vec![s]).collect());
             }
+
+            println!("[debug] pro_conds: {:?}", pro_conds);
 
             // TODO: deal wtih pro_conds
 
@@ -141,6 +143,10 @@ impl<'a> ConfigFeatures<'a> {
     fn process_cfg_cond(&self, cond: &MetaItem) -> Vec<String> {
         let left_val = cond.ident().expect("rustc resolve feature fails").as_str().to_string();
 
+        if left_val.starts_with("target") {
+            return vec![];
+        }
+
         let req = match &cond.kind {
             MetaItemKind::Word => vec![left_val],
             MetaItemKind::NameValue(lit) => {
@@ -164,7 +170,16 @@ impl<'a> ConfigFeatures<'a> {
                 if left_val.as_str() == "any" {
                     nest_conds.into_iter().flatten().collect()
                 } else {
-                    nest_conds.into_iter().map(|conds| format!("{}({})",left_val, conds.join(","))).collect()
+                    nest_conds
+                        .into_iter()
+                        .map(|conds| {
+                            if conds.len() <= 1 {
+                                conds.join(",")
+                            } else {
+                                format!("{}({})", left_val, conds.join(","))
+                            }
+                        })
+                        .collect()
                 }
             }
         };
@@ -235,8 +250,10 @@ impl<'a> ConfigFeatures<'a> {
 }
 
 fn vec_mul<T: Clone>(a: Vec<Vec<T>>, b: Vec<Vec<T>>) -> Vec<Vec<T>> {
-    if a.is_empty() || b.is_empty() {
-        panic!("rustc resolve feature fails");
+    if a.is_empty() {
+        return b;
+    } else if b.is_empty() {
+        return a;
     }
 
     a.into_iter()
