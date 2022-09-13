@@ -212,7 +212,7 @@ top_level_options!(
         working_dir: RealFileName [TRACKED],
 
         /// For our nightly features analysis
-        nft_analysis: bool [UNTRACKED],
+        ruf_analysis: bool [UNTRACKED],
     }
 );
 

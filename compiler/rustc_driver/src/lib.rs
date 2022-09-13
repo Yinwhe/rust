@@ -346,7 +346,7 @@ fn run_compiler(
                 return early_exit();
             }
 
-            if sess.opts.nft_analysis {
+            if sess.opts.ruf_analysis {
                 my_plugin(queries);
                 return early_exit();
             }

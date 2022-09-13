@@ -744,7 +744,7 @@ impl Default for Options {
             json_future_incompat: false,
             pretty: None,
             working_dir: RealFileName::LocalPath(std::env::current_dir().unwrap()),
-            nft_analysis: false,
+            ruf_analysis: false,
         }
     }
 }
@@ -1384,7 +1384,7 @@ pub fn rustc_short_optgroups() -> Vec<RustcOptGroup> {
         opt::multi_s("C", "codegen", "Set a codegen option", "OPT[=VALUE]"),
         opt::flag_s("V", "version", "Print version info and exit"),
         opt::flag_s("v", "verbose", "Use verbose output"),
-        opt::flag_s("", "nft-analysis", "Nightly feature analysis"),
+        opt::flag_s("", "ruf-analysis", "Rust nightly feature analysis"),
     ]
 }
 
@@ -2206,7 +2206,7 @@ pub fn build_session_options(matches: &getopts::Matches) -> Options {
 
     let edition = parse_crate_edition(matches);
 
-    let nft_analysis = matches.opt_present("nft-analysis");
+    let ruf_analysis = matches.opt_present("ruf-analysis");
 
     let JsonConfig {
         json_rendered,
@@ -2510,7 +2510,7 @@ pub fn build_session_options(matches: &getopts::Matches) -> Options {
         json_future_incompat,
         pretty,
         working_dir,
-        nft_analysis,
+        ruf_analysis,
     }
 }
 
