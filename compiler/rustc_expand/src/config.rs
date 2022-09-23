@@ -56,7 +56,7 @@ impl<'a> ConfigFeatures<'a> {
         self.processed_cfg_attrs_datas
             .iter()
             .map(|(conds, feat)| {
-                println!("([{}], {})", conds.join(","), feat);
+                println!("processed ([{}], {})", conds.join(","), feat);
             })
             .count();
     }
@@ -65,7 +65,7 @@ impl<'a> ConfigFeatures<'a> {
         self.visulized_cfg_attrs_datas
             .iter()
             .map(|(conds, attr)| {
-                println!("([{}], {})", conds.join(","), attr);
+                println!("formatori ([{}], {})", conds.join(","), attr);
             })
             .count();
     }
