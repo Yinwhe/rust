@@ -39,6 +39,7 @@ pub struct StripUnconfigured<'a> {
 pub struct ConfigFeatures<'a> {
     pub sess: &'a Session,
     pub origin_cfg_attrs_datas: Vec<(Vec<MetaItem>, Attribute)>,
+    pub mediate_cfg_attrs_datas: Vec<(Vec<String>, Attribute)>,
     pub processed_cfg_attrs_datas: Vec<(Vec<String>, String)>,
 }
 
@@ -58,6 +59,10 @@ impl<'a> ConfigFeatures<'a> {
                 println!("([{}], {})", conds.join(","), feat);
             })
             .count();
+    }
+
+    pub fn print_mediate(&self) {
+        
     }
 
     pub fn process_analysis_result(&mut self) {
@@ -150,33 +155,45 @@ impl<'a> ConfigFeatures<'a> {
                 vec![format!("{} = {}", &left_val, lit.token_lit.symbol.as_str())]
             }
             MetaItemKind::List(nmetas) => {
-                let mut nest_conds = vec![vec![]];
+                let mut nest_conds = vec![];
 
                 for nmeta in nmetas {
                     match nmeta {
                         NestedMetaItem::MetaItem(meta) => {
-                            nest_conds = vec_mul(
-                                nest_conds,
-                                self.process_cfg_cond(meta).into_iter().map(|s| vec![s]).collect(),
-                            );
+                            nest_conds.push(self.process_cfg_cond(meta));
                         }
                         _ => panic!("rustc resolve feature fails"),
                     }
                 }
 
                 if left_val.as_str() == "any" {
-                    nest_conds.into_iter().flatten().collect()
+                    // Union
+                   nest_conds.into_iter().flatten().collect()
+                } else if left_val.as_str() == "all" {
+                    // Multi
+                    let mut mul_res = vec![];
+                    for conds in nest_conds {
+                        mul_res = vec_mul(mul_res, conds.into_iter().map(|s| vec![s]).collect());
+                    }
+                    mul_res.into_iter().map(|conds| if conds.len() == 1 {
+                        conds.join(",")
+                    } else {
+                        format!("all({})", conds.join(","))
+                    }).collect()
+                } else if left_val.as_str() == "not" {
+                    if nest_conds.len() != 1 {
+                        panic!("rustc resolve feature fails");
+                    }
+
+                    let conds = nest_conds.first().unwrap();
+                    if conds.len() == 1 {
+                        vec![format!("not({})", conds.join(","))]
+                    } else {
+                        vec![format!("not(any{})", conds.join(","))]
+                    }
+
                 } else {
-                    nest_conds
-                        .into_iter()
-                        .map(|conds| {
-                            if conds.len() <= 1 {
-                                conds.join(",")
-                            } else {
-                                format!("{}({})", left_val, conds.join(","))
-                            }
-                        })
-                        .collect()
+                    panic!("rustc resolve feature fails");
                 }
             }
         };
@@ -502,7 +519,11 @@ impl<'a> StripUnconfigured<'a> {
 
     fn configure_krate_attrs(&self, mut attrs: Vec<ast::Attribute>) -> Option<Vec<ast::Attribute>> {
         attrs.flat_map_in_place(|attr| self.process_cfg_attr(attr));
-        if self.in_cfg(&attrs) { Some(attrs) } else { None }
+        if self.in_cfg(&attrs) {
+            Some(attrs)
+        } else {
+            None
+        }
     }
 
     /// Performs cfg-expansion on `stream`, producing a new `AttrAnnotatedTokenStream`.
@@ -572,7 +593,11 @@ impl<'a> StripUnconfigured<'a> {
     }
 
     fn process_cfg_attr(&self, attr: Attribute) -> Vec<Attribute> {
-        if attr.has_name(sym::cfg_attr) { self.expand_cfg_attr(attr, true) } else { vec![attr] }
+        if attr.has_name(sym::cfg_attr) {
+            self.expand_cfg_attr(attr, true)
+        } else {
+            vec![attr]
+        }
     }
 
     /// Parse and expand a single `cfg_attr` attribute into a list of attributes
