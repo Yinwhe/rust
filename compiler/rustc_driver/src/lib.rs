@@ -442,10 +442,14 @@ fn my_plugin(queries: &Queries<'_>) {
     let mut config_features = ConfigFeatures {
         sess: queries.session(),
         origin_cfg_attrs_datas: Vec::new(),
+        visulized_cfg_attrs_datas: Vec::new(),
         processed_cfg_attrs_datas: Vec::new(),
     };
 
     config_features.analysis_krate_attrs(krate.attrs);
+    
+    config_features.print_visulized();
+    println!("-------------------------------------");
     config_features.print_processed();
     println!("||| Nightly Feature Analysis End |||");
 }

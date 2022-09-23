@@ -39,7 +39,7 @@ pub struct StripUnconfigured<'a> {
 pub struct ConfigFeatures<'a> {
     pub sess: &'a Session,
     pub origin_cfg_attrs_datas: Vec<(Vec<MetaItem>, Attribute)>,
-    pub mediate_cfg_attrs_datas: Vec<(Vec<String>, Attribute)>,
+    pub visulized_cfg_attrs_datas: Vec<(Vec<String>, String)>,
     pub processed_cfg_attrs_datas: Vec<(Vec<String>, String)>,
 }
 
@@ -61,12 +61,18 @@ impl<'a> ConfigFeatures<'a> {
             .count();
     }
 
-    pub fn print_mediate(&self) {
-        
+    pub fn print_visulized(&self) {
+        self.visulized_cfg_attrs_datas
+            .iter()
+            .map(|(conds, attr)| {
+                println!("([{}], {})", conds.join(","), attr);
+            })
+            .count();
     }
 
     pub fn process_analysis_result(&mut self) {
         let mut items = vec![];
+        let mut viz_items = vec![];
 
         for (conds, attr) in &self.origin_cfg_attrs_datas {
             let mut pro_conds = vec![vec![]];
@@ -75,6 +81,9 @@ impl<'a> ConfigFeatures<'a> {
             if !attr.has_name(sym::feature) {
                 continue;
             }
+
+            let viz_conds: Vec<String> =
+                conds.iter().map(|cond| self.visulize_cfg_cond(cond)).collect();
 
             for cond in conds {
                 let tmp = self.process_cfg_cond(cond);
@@ -87,6 +96,7 @@ impl<'a> ConfigFeatures<'a> {
                         if let TokenTree::Token(token, _) = token {
                             if let Some((ident, _)) = token.ident() {
                                 pro_feats.push(ident.name.to_string());
+                                viz_items.push((viz_conds.clone(), ident.name.to_string()));
                             }
                         }
                     }
@@ -109,6 +119,7 @@ impl<'a> ConfigFeatures<'a> {
                 .count();
         }
 
+        viz_items.into_iter().map(|item| self.assign_vis(item)).count();
         items.into_iter().map(|item| self.assign_pro(item)).count();
     }
 
@@ -134,12 +145,45 @@ impl<'a> ConfigFeatures<'a> {
         }
     }
 
+    #[inline]
     fn assign_ori(&mut self, item: (Vec<MetaItem>, Attribute)) {
         self.origin_cfg_attrs_datas.push(item);
     }
 
+    #[inline]
     fn assign_pro(&mut self, item: (Vec<String>, String)) {
         self.processed_cfg_attrs_datas.push(item);
+    }
+
+    #[inline]
+    fn assign_vis(&mut self, item: (Vec<String>, String)) {
+        self.visulized_cfg_attrs_datas.push(item);
+    }
+
+    fn visulize_cfg_cond(&self, cond: &MetaItem) -> String {
+        let req = match &cond.kind {
+            MetaItemKind::Word => cond.ident().expect("rustc resolve feature fails").as_str().to_string(),
+            MetaItemKind::NameValue(lit) => {
+                format!("{} = {}", cond.ident().expect("rustc resolve feature fails").as_str(), lit.token_lit.symbol.as_str(),)
+            }
+            MetaItemKind::List(nmetas) => {
+                let mut req = String::new();
+
+                for nmeta in nmetas {
+                    match nmeta {
+                        NestedMetaItem::MetaItem(meta) => {
+                            req.push_str(&self.visulize_cfg_cond(meta));
+                            req.push_str(",")
+                        }
+                        _ => panic!("rustc resolve feature fails"),
+                    }
+                }
+                req.pop();
+                format!("{}({})", cond.ident().expect("rustc resolve feature fails").as_str(), req)
+            }
+        };
+
+        req
     }
 
     fn process_cfg_cond(&self, cond: &MetaItem) -> Vec<String> {
