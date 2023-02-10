@@ -80,10 +80,10 @@ impl Res {
         }
     }
 
-    fn def_id(self, tcx: TyCtxt<'_>) -> DefId {
+    fn def_id(self, tcx: TyCtxt<'_>) -> Option<DefId> {
         match self {
-            Res::Def(_, id) => id,
-            Res::Primitive(prim) => *PrimitiveType::primitive_locations(tcx).get(&prim).unwrap(),
+            Res::Def(_, id) => Some(id),
+            Res::Primitive(prim) => PrimitiveType::primitive_locations(tcx).get(&prim).copied(),
         }
     }
 
@@ -223,6 +223,9 @@ enum MalformedGenerics {
 #[derive(Clone, Debug, Hash, PartialEq, Eq)]
 pub(crate) enum UrlFragment {
     Item(DefId),
+    /// A part of a page that isn't a rust item.
+    ///
+    /// Eg: `[Vector Examples](std::vec::Vec#examples)`
     UserWritten(String),
 }
 
@@ -399,6 +402,7 @@ impl<'a, 'tcx> LinkCollector<'a, 'tcx> {
             })
             .and_then(|self_id| match tcx.def_kind(self_id) {
                 DefKind::Impl => self.def_id_to_res(self_id),
+                DefKind::Use => None,
                 def_kind => Some(Res::Def(def_kind, self_id)),
             })
     }
@@ -477,7 +481,7 @@ impl<'a, 'tcx> LinkCollector<'a, 'tcx> {
             // If there's no `::`, it's not an associated item.
             // So we can be sure that `rustc_resolve` was accurate when it said it wasn't resolved.
             .ok_or_else(|| {
-                debug!("found no `::`, assumming {} was correctly not in scope", item_name);
+                debug!("found no `::`, assuming {} was correctly not in scope", item_name);
                 UnresolvedPath {
                     item_id,
                     module_id,
@@ -534,11 +538,11 @@ impl<'a, 'tcx> LinkCollector<'a, 'tcx> {
             ty::Adt(ty::AdtDef(Interned(&ty::AdtDefData { did, .. }, _)), _) | ty::Foreign(did) => {
                 Res::from_def_id(self.cx.tcx, did)
             }
-            ty::Projection(_)
+            ty::Alias(..)
             | ty::Closure(..)
             | ty::Generator(..)
             | ty::GeneratorWitness(_)
-            | ty::Opaque(..)
+            | ty::GeneratorWitnessMIR(..)
             | ty::Dynamic(..)
             | ty::Param(_)
             | ty::Bound(..)
@@ -750,7 +754,7 @@ fn resolve_associated_trait_item<'a>(
 ///
 /// This is just a wrapper around [`TyCtxt::impl_item_implementor_ids()`] and
 /// [`TyCtxt::associated_item()`] (with some helpful logging added).
-#[instrument(level = "debug", skip(tcx))]
+#[instrument(level = "debug", skip(tcx), ret)]
 fn trait_assoc_to_impl_assoc_item<'tcx>(
     tcx: TyCtxt<'tcx>,
     impl_id: DefId,
@@ -760,9 +764,7 @@ fn trait_assoc_to_impl_assoc_item<'tcx>(
     debug!(?trait_to_impl_assoc_map);
     let impl_assoc_id = *trait_to_impl_assoc_map.get(&trait_assoc_id)?;
     debug!(?impl_assoc_id);
-    let impl_assoc = tcx.associated_item(impl_assoc_id);
-    debug!(?impl_assoc);
-    Some(impl_assoc)
+    Some(tcx.associated_item(impl_assoc_id))
 }
 
 /// Given a type, return all trait impls in scope in `module` for that type.
@@ -785,7 +787,7 @@ fn trait_impls_for<'a>(
         tcx.find_map_relevant_impl(trait_, ty, |impl_| {
             let trait_ref = tcx.impl_trait_ref(impl_).expect("this is not an inherent impl");
             // Check if these are the same type.
-            let impl_type = trait_ref.self_ty();
+            let impl_type = trait_ref.skip_binder().self_ty();
             trace!(
                 "comparing type {} with kind {:?} against type {:?}",
                 impl_type,
@@ -1126,10 +1128,10 @@ impl LinkCollector<'_, '_> {
                     }
                 }
 
-                Some(ItemLink {
+                res.def_id(self.cx.tcx).map(|page_id| ItemLink {
                     link: ori_link.link.clone(),
                     link_text: link_text.clone(),
-                    did: res.def_id(self.cx.tcx),
+                    page_id,
                     fragment,
                 })
             }
@@ -1148,11 +1150,12 @@ impl LinkCollector<'_, '_> {
                     item,
                     &diag_info,
                 )?;
-                let id = clean::register_res(self.cx, rustc_hir::def::Res::Def(kind, id));
+
+                let page_id = clean::register_res(self.cx, rustc_hir::def::Res::Def(kind, id));
                 Some(ItemLink {
                     link: ori_link.link.clone(),
                     link_text: link_text.clone(),
-                    did: id,
+                    page_id,
                     fragment,
                 })
             }
@@ -1192,16 +1195,11 @@ impl LinkCollector<'_, '_> {
             }
 
         // item can be non-local e.g. when using #[doc(primitive = "pointer")]
-        if let Some((src_id, dst_id)) = id
-            .as_local()
-            // The `expect_def_id()` should be okay because `local_def_id_to_hir_id`
-            // would presumably panic if a fake `DefIndex` were passed.
-            .and_then(|dst_id| {
-                item.item_id.expect_def_id().as_local().map(|src_id| (src_id, dst_id))
-            })
-        {
-            if self.cx.tcx.privacy_access_levels(()).is_exported(src_id)
-                && !self.cx.tcx.privacy_access_levels(()).is_exported(dst_id)
+        if let Some((src_id, dst_id)) = id.as_local().and_then(|dst_id| {
+            item.item_id.expect_def_id().as_local().map(|src_id| (src_id, dst_id))
+        }) {
+            if self.cx.tcx.effective_visibilities(()).is_exported(src_id)
+                && !self.cx.tcx.effective_visibilities(()).is_exported(dst_id)
             {
                 privacy_error(self.cx, diag_info, path_str);
             }
@@ -1256,7 +1254,7 @@ impl LinkCollector<'_, '_> {
         &mut self,
         key: ResolutionInfo,
         diag: DiagnosticInfo<'_>,
-        // If errors are cached then they are only reported on first ocurrence
+        // If errors are cached then they are only reported on first occurrence
         // which we want in some cases but not in others.
         cache_errors: bool,
     ) -> Option<(Res, Option<UrlFragment>)> {
@@ -1607,9 +1605,7 @@ fn report_diagnostic(
 
     let sp = item.attr_span(tcx);
 
-    tcx.struct_span_lint_hir(lint, hir_id, sp, |lint| {
-        let mut diag = lint.build(msg);
-
+    tcx.struct_span_lint_hir(lint, hir_id, sp, msg, |lint| {
         let span =
             super::source_span_for_markdown_range(tcx, dox, link_range, &item.attrs).map(|sp| {
                 if dox.as_bytes().get(link_range.start) == Some(&b'`')
@@ -1622,7 +1618,7 @@ fn report_diagnostic(
             });
 
         if let Some(sp) = span {
-            diag.set_span(sp);
+            lint.set_span(sp);
         } else {
             // blah blah blah\nblah\nblah [blah] blah blah\nblah blah
             //                       ^     ~~~~
@@ -1632,7 +1628,7 @@ fn report_diagnostic(
             let line = dox[last_new_line_offset..].lines().next().unwrap_or("");
 
             // Print the line containing the `link_range` and manually mark it with '^'s.
-            diag.note(&format!(
+            lint.note(&format!(
                 "the link appears in this line:\n\n{line}\n\
                      {indicator: <before$}{indicator:^<found$}",
                 line = line,
@@ -1642,9 +1638,9 @@ fn report_diagnostic(
             ));
         }
 
-        decorate(&mut diag, span);
+        decorate(lint, span);
 
-        diag.emit();
+        lint
     });
 }
 
@@ -1772,7 +1768,6 @@ fn resolution_failure(
 
                     // Otherwise, it must be an associated item or variant
                     let res = partial_res.expect("None case was handled by `last_found_module`");
-                    let name = res.name(tcx);
                     let kind = match res {
                         Res::Def(kind, _) => Some(kind),
                         Res::Primitive(_) => None,
@@ -1807,13 +1802,14 @@ fn resolution_failure(
                                 }
                                 return;
                             }
-                            Trait | TyAlias | ForeignTy | OpaqueTy | TraitAlias | TyParam
-                            | Static(_) => "associated item",
+                            Trait | TyAlias | ForeignTy | OpaqueTy | ImplTraitPlaceholder
+                            | TraitAlias | TyParam | Static(_) => "associated item",
                             Impl | GlobalAsm => unreachable!("not a path"),
                         }
                     } else {
                         "associated item"
                     };
+                    let name = res.name(tcx);
                     let note = format!(
                         "the {} `{}` has no {} named `{}`",
                         res.descr(),
@@ -1893,7 +1889,7 @@ fn disambiguator_error(
     diag_info.link_range = disambiguator_range;
     report_diagnostic(cx.tcx, BROKEN_INTRA_DOC_LINKS, msg, &diag_info, |diag, _sp| {
         let msg = format!(
-            "see {}/rustdoc/linking-to-items-by-name.html#namespaces-and-disambiguators for more info about disambiguators",
+            "see {}/rustdoc/write-documentation/linking-to-items-by-name.html#namespaces-and-disambiguators for more info about disambiguators",
             crate::DOC_RUST_LANG_ORG_CHANNEL
         );
         diag.note(&msg);

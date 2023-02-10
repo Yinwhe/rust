@@ -1,9 +1,8 @@
 //! Parsing and validation of builtin attributes
 
 use rustc_ast as ast;
-use rustc_ast::{Attribute, Lit, LitKind, MetaItem, MetaItemKind, NestedMetaItem, NodeId};
+use rustc_ast::{Attribute, LitKind, MetaItem, MetaItemKind, MetaItemLit, NestedMetaItem, NodeId};
 use rustc_ast_pretty::pprust;
-use rustc_errors::{struct_span_err, Applicability};
 use rustc_feature::{find_gated_cfg, is_builtin_attr_name, Features, GatedCfg};
 use rustc_macros::HashStable_Generic;
 use rustc_session::lint::builtin::UNEXPECTED_CFGS;
@@ -13,6 +12,20 @@ use rustc_session::Session;
 use rustc_span::hygiene::Transparency;
 use rustc_span::{symbol::sym, symbol::Symbol, Span};
 use std::num::NonZeroU32;
+
+use crate::session_diagnostics::{self, IncorrectReprFormatGenericCause};
+
+/// The version placeholder that recently stabilized features contain inside the
+/// `since` field of the `#[stable]` attribute.
+///
+/// For more, see [this pull request](https://github.com/rust-lang/rust/pull/100591).
+pub const VERSION_PLACEHOLDER: &str = "CURRENT_RUSTC_VERSION";
+
+pub fn rust_version_symbol() -> Symbol {
+    let version = option_env!("CFG_VERSION").unwrap_or("<current>");
+    let version = version.split(' ').next().unwrap();
+    Symbol::intern(&version)
+}
 
 pub fn is_builtin_attr(attr: &Attribute) -> bool {
     attr.is_doc_comment() || attr.ident().filter(|ident| is_builtin_attr_name(ident.name)).is_some()
@@ -25,46 +38,43 @@ enum AttrError {
     NonIdentFeature,
     MissingFeature,
     MultipleStabilityLevels,
-    UnsupportedLiteral(&'static str, /* is_bytestr */ bool),
+    UnsupportedLiteral(UnsupportedLiteralReason, /* is_bytestr */ bool),
+}
+
+pub(crate) enum UnsupportedLiteralReason {
+    Generic,
+    CfgString,
+    DeprecatedString,
+    DeprecatedKvPair,
 }
 
 fn handle_errors(sess: &ParseSess, span: Span, error: AttrError) {
-    let diag = &sess.span_diagnostic;
     match error {
         AttrError::MultipleItem(item) => {
-            struct_span_err!(diag, span, E0538, "multiple '{}' items", item).emit();
+            sess.emit_err(session_diagnostics::MultipleItem { span, item });
         }
         AttrError::UnknownMetaItem(item, expected) => {
-            let expected = expected.iter().map(|name| format!("`{}`", name)).collect::<Vec<_>>();
-            struct_span_err!(diag, span, E0541, "unknown meta item '{}'", item)
-                .span_label(span, format!("expected one of {}", expected.join(", ")))
-                .emit();
+            sess.emit_err(session_diagnostics::UnknownMetaItem { span, item, expected });
         }
         AttrError::MissingSince => {
-            struct_span_err!(diag, span, E0542, "missing 'since'").emit();
+            sess.emit_err(session_diagnostics::MissingSince { span });
         }
         AttrError::NonIdentFeature => {
-            struct_span_err!(diag, span, E0546, "'feature' is not an identifier").emit();
+            sess.emit_err(session_diagnostics::NonIdentFeature { span });
         }
         AttrError::MissingFeature => {
-            struct_span_err!(diag, span, E0546, "missing 'feature'").emit();
+            sess.emit_err(session_diagnostics::MissingFeature { span });
         }
         AttrError::MultipleStabilityLevels => {
-            struct_span_err!(diag, span, E0544, "multiple stability levels").emit();
+            sess.emit_err(session_diagnostics::MultipleStabilityLevels { span });
         }
-        AttrError::UnsupportedLiteral(msg, is_bytestr) => {
-            let mut err = struct_span_err!(diag, span, E0565, "{}", msg);
-            if is_bytestr {
-                if let Ok(lint_str) = sess.source_map().span_to_snippet(span) {
-                    err.span_suggestion(
-                        span,
-                        "consider removing the prefix",
-                        &lint_str[1..],
-                        Applicability::MaybeIncorrect,
-                    );
-                }
-            }
-            err.emit();
+        AttrError::UnsupportedLiteral(reason, is_bytestr) => {
+            sess.emit_err(session_diagnostics::UnsupportedLiteral {
+                span,
+                reason,
+                is_bytestr,
+                start_point_span: sess.source_map().start_point(span),
+            });
         }
     }
 }
@@ -243,8 +253,6 @@ where
     let mut promotable = false;
     let mut allowed_through_unstable_modules = false;
 
-    let diagnostic = &sess.parse_sess.span_diagnostic;
-
     'outer: for attr in attrs_iter {
         if ![
             sym::rustc_const_unstable,
@@ -269,8 +277,7 @@ where
             allowed_through_unstable_modules = true;
         }
         // attributes with data
-        else if let Some(MetaItem { kind: MetaItemKind::List(ref metas), .. }) = meta {
-            let meta = meta.as_ref().unwrap();
+        else if let Some(meta @ MetaItem { kind: MetaItemKind::List(metas), .. }) = &meta {
             let get = |meta: &MetaItem, item: &mut Option<Symbol>| {
                 if item.is_some() {
                     handle_errors(
@@ -284,7 +291,7 @@ where
                     *item = Some(v);
                     true
                 } else {
-                    struct_span_err!(diagnostic, meta.span, E0539, "incorrect meta item").emit();
+                    sess.emit_err(session_diagnostics::IncorrectMetaItem { span: meta.span });
                     false
                 }
             };
@@ -326,7 +333,7 @@ where
                             handle_errors(
                                 &sess.parse_sess,
                                 meta.span(),
-                                AttrError::UnsupportedLiteral("unsupported literal", false),
+                                AttrError::UnsupportedLiteral(UnsupportedLiteralReason::Generic, false),
                             );
                             continue 'outer;
                         };
@@ -350,39 +357,28 @@ where
                                 // is a name/value pair string literal.
                                 issue_num = match issue.unwrap().as_str() {
                                     "none" => None,
-                                    issue => {
-                                        let emit_diag = |msg: &str| {
-                                            struct_span_err!(
-                                                diagnostic,
-                                                mi.span,
-                                                E0545,
-                                                "`issue` must be a non-zero numeric string \
-                                                or \"none\"",
-                                            )
-                                            .span_label(mi.name_value_literal_span().unwrap(), msg)
-                                            .emit();
-                                        };
-                                        match issue.parse() {
-                                            Ok(0) => {
-                                                emit_diag(
-                                                    "`issue` must not be \"0\", \
-                                                    use \"none\" instead",
-                                                );
-                                                continue 'outer;
-                                            }
-                                            Ok(num) => NonZeroU32::new(num),
-                                            Err(err) => {
-                                                emit_diag(&err.to_string());
-                                                continue 'outer;
-                                            }
+                                    issue => match issue.parse::<NonZeroU32>() {
+                                        Ok(num) => Some(num),
+                                        Err(err) => {
+                                            sess.emit_err(
+                                                session_diagnostics::InvalidIssueString {
+                                                    span: mi.span,
+                                                    cause: session_diagnostics::InvalidIssueStringCause::from_int_error_kind(
+                                                        mi.name_value_literal_span().unwrap(),
+                                                        err.kind(),
+                                                    ),
+                                                },
+                                            );
+                                            continue 'outer;
                                         }
-                                    }
+                                    },
                                 };
                             }
                             sym::soft => {
                                 if !mi.is_word() {
-                                    let msg = "`soft` should not have any arguments";
-                                    sess.parse_sess.span_diagnostic.span_err(mi.span, msg);
+                                    sess.emit_err(session_diagnostics::SoftNoArgs {
+                                        span: mi.span,
+                                    });
                                 }
                                 is_soft = true;
                             }
@@ -440,8 +436,7 @@ where
                             continue;
                         }
                         _ => {
-                            struct_span_err!(diagnostic, attr.span, E0547, "missing 'issue'")
-                                .emit();
+                            sess.emit_err(session_diagnostics::MissingIssue { span: attr.span });
                             continue;
                         }
                     }
@@ -490,15 +485,22 @@ where
                                     continue 'outer;
                                 }
                             },
-                            NestedMetaItem::Literal(lit) => {
+                            NestedMetaItem::Lit(lit) => {
                                 handle_errors(
                                     &sess.parse_sess,
                                     lit.span,
-                                    AttrError::UnsupportedLiteral("unsupported literal", false),
+                                    AttrError::UnsupportedLiteral(
+                                        UnsupportedLiteralReason::Generic,
+                                        false,
+                                    ),
                                 );
                                 continue 'outer;
                             }
                         }
+                    }
+
+                    if let Some(s) = since && s.as_str() == VERSION_PLACEHOLDER {
+                        since = Some(rust_version_symbol());
                     }
 
                     match (feature, since) {
@@ -530,38 +532,24 @@ where
 
     // Merge the const-unstable info into the stability info
     if promotable {
-        if let Some((ref mut stab, _)) = const_stab {
-            stab.promotable = promotable;
-        } else {
-            struct_span_err!(
-                diagnostic,
-                item_sp,
-                E0717,
-                "`rustc_promotable` attribute must be paired with either a `rustc_const_unstable` \
-                or a `rustc_const_stable` attribute"
-            )
-            .emit();
+        match &mut const_stab {
+            Some((stab, _)) => stab.promotable = promotable,
+            _ => _ = sess.emit_err(session_diagnostics::RustcPromotablePairing { span: item_sp }),
         }
     }
 
     if allowed_through_unstable_modules {
-        if let Some((
-            Stability {
-                level: StabilityLevel::Stable { ref mut allowed_through_unstable_modules, .. },
-                ..
-            },
-            _,
-        )) = stab
-        {
-            *allowed_through_unstable_modules = true;
-        } else {
-            struct_span_err!(
-                diagnostic,
-                item_sp,
-                E0789,
-                "`rustc_allowed_through_unstable_modules` attribute must be paired with a `stable` attribute"
-            )
-            .emit();
+        match &mut stab {
+            Some((
+                Stability {
+                    level: StabilityLevel::Stable { allowed_through_unstable_modules, .. },
+                    ..
+                },
+                _,
+            )) => *allowed_through_unstable_modules = true,
+            _ => {
+                sess.emit_err(session_diagnostics::RustcAllowedUnstablePairing { span: item_sp });
+            }
         }
     }
 
@@ -631,7 +619,7 @@ fn try_gate_cfg(name: Symbol, span: Span, sess: &ParseSess, features: Option<&Fe
 fn gate_cfg(gated_cfg: &GatedCfg, cfg_span: Span, sess: &ParseSess, features: &Features) {
     let (cfg, feature, has_feature) = gated_cfg;
     if !has_feature(features) && !cfg_span.allows_unstable(*feature) {
-        let explain = format!("`cfg({})` is experimental and subject to change", cfg);
+        let explain = format!("`cfg({cfg})` is experimental and subject to change");
         feature_err(sess, *feature, cfg_span, &explain).emit();
     }
 }
@@ -664,36 +652,29 @@ pub fn eval_condition(
     features: Option<&Features>,
     eval: &mut impl FnMut(Condition) -> bool,
 ) -> bool {
-    match cfg.kind {
-        ast::MetaItemKind::List(ref mis) if cfg.name_or_empty() == sym::version => {
+    match &cfg.kind {
+        ast::MetaItemKind::List(mis) if cfg.name_or_empty() == sym::version => {
             try_gate_cfg(sym::version, cfg.span, sess, features);
             let (min_version, span) = match &mis[..] {
-                [NestedMetaItem::Literal(Lit { kind: LitKind::Str(sym, ..), span, .. })] => {
+                [NestedMetaItem::Lit(MetaItemLit { kind: LitKind::Str(sym, ..), span, .. })] => {
                     (sym, span)
                 }
                 [
-                    NestedMetaItem::Literal(Lit { span, .. })
+                    NestedMetaItem::Lit(MetaItemLit { span, .. })
                     | NestedMetaItem::MetaItem(MetaItem { span, .. }),
                 ] => {
-                    sess.span_diagnostic
-                        .struct_span_err(*span, "expected a version literal")
-                        .emit();
+                    sess.emit_err(session_diagnostics::ExpectedVersionLiteral { span: *span });
                     return false;
                 }
                 [..] => {
-                    sess.span_diagnostic
-                        .struct_span_err(cfg.span, "expected single version literal")
-                        .emit();
+                    sess.emit_err(session_diagnostics::ExpectedSingleVersionLiteral {
+                        span: cfg.span,
+                    });
                     return false;
                 }
             };
             let Some(min_version) = parse_version(min_version.as_str(), false) else {
-                sess.span_diagnostic
-                    .struct_span_warn(
-                        *span,
-                        "unknown version literal format, assuming it refers to a future version",
-                    )
-                    .emit();
+                sess.emit_warning(session_diagnostics::UnknownVersionLiteral { span: *span });
                 return false;
             };
             let rustc_version = parse_version(env!("CFG_RELEASE"), true).unwrap();
@@ -705,13 +686,13 @@ pub fn eval_condition(
                 rustc_version >= min_version
             }
         }
-        ast::MetaItemKind::List(ref mis) => {
+        ast::MetaItemKind::List(mis) => {
             for mi in mis.iter() {
                 if !mi.is_meta_item() {
                     handle_errors(
                         sess,
                         mi.span(),
-                        AttrError::UnsupportedLiteral("unsupported literal", false),
+                        AttrError::UnsupportedLiteral(UnsupportedLiteralReason::Generic, false),
                     );
                     return false;
                 }
@@ -736,13 +717,9 @@ pub fn eval_condition(
                     }),
                 sym::not => {
                     if mis.len() != 1 {
-                        struct_span_err!(
-                            sess.span_diagnostic,
-                            cfg.span,
-                            E0536,
-                            "expected 1 cfg-pattern"
-                        )
-                        .emit();
+                        sess.emit_err(session_diagnostics::ExpectedOneCfgPattern {
+                            span: cfg.span,
+                        });
                         return false;
                     }
 
@@ -768,29 +745,24 @@ pub fn eval_condition(
                     })
                 }
                 _ => {
-                    struct_span_err!(
-                        sess.span_diagnostic,
-                        cfg.span,
-                        E0537,
-                        "invalid predicate `{}`",
-                        pprust::path_to_string(&cfg.path)
-                    )
-                    .emit();
+                    sess.emit_err(session_diagnostics::InvalidPredicate {
+                        span: cfg.span,
+                        predicate: pprust::path_to_string(&cfg.path),
+                    });
                     false
                 }
             }
         }
         ast::MetaItemKind::Word | MetaItemKind::NameValue(..) if cfg.path.segments.len() != 1 => {
-            sess.span_diagnostic
-                .span_err(cfg.path.span, "`cfg` predicate key must be an identifier");
+            sess.emit_err(session_diagnostics::CfgPredicateIdentifier { span: cfg.path.span });
             true
         }
-        MetaItemKind::NameValue(ref lit) if !lit.kind.is_str() => {
+        MetaItemKind::NameValue(lit) if !lit.kind.is_str() => {
             handle_errors(
                 sess,
                 lit.span,
                 AttrError::UnsupportedLiteral(
-                    "literal in `cfg` predicate value must be a string",
+                    UnsupportedLiteralReason::CfgString,
                     lit.kind.is_bytestr(),
                 ),
             );
@@ -834,7 +806,6 @@ where
     I: Iterator<Item = &'a Attribute>,
 {
     let mut depr: Option<(Deprecation, Span)> = None;
-    let diagnostic = &sess.parse_sess.span_diagnostic;
     let is_rustc = sess.features_untracked().staged_api;
 
     'outer: for attr in attrs_iter {
@@ -870,14 +841,14 @@ where
                                 &sess.parse_sess,
                                 lit.span,
                                 AttrError::UnsupportedLiteral(
-                                    "literal in `deprecated` \
-                                    value must be a string",
+                                    UnsupportedLiteralReason::DeprecatedString,
                                     lit.kind.is_bytestr(),
                                 ),
                             );
                         } else {
-                            struct_span_err!(diagnostic, meta.span, E0551, "incorrect meta item")
-                                .emit();
+                            sess.emit_err(session_diagnostics::IncorrectMetaItem2 {
+                                span: meta.span,
+                            });
                         }
 
                         false
@@ -899,14 +870,11 @@ where
                             }
                             sym::suggestion => {
                                 if !sess.features_untracked().deprecated_suggestion {
-                                    let mut diag = sess.struct_span_err(
-                                        mi.span,
-                                        "suggestions on deprecated items are unstable",
-                                    );
-                                    if sess.is_nightly_build() {
-                                        diag.help("add `#![feature(deprecated_suggestion)]` to the crate root");
-                                    }
-                                    diag.note("see #94785 for more details").emit();
+                                    sess.emit_err(session_diagnostics::DeprecatedItemSuggestion {
+                                        span: mi.span,
+                                        is_nightly: sess.is_nightly_build().then_some(()),
+                                        details: (),
+                                    });
                                 }
 
                                 if !get(mi, &mut suggestion) {
@@ -929,12 +897,12 @@ where
                                 continue 'outer;
                             }
                         },
-                        NestedMetaItem::Literal(lit) => {
+                        NestedMetaItem::Lit(lit) => {
                             handle_errors(
                                 &sess.parse_sess,
                                 lit.span,
                                 AttrError::UnsupportedLiteral(
-                                    "item in `deprecated` must be a key/value pair",
+                                    UnsupportedLiteralReason::DeprecatedKvPair,
                                     false,
                                 ),
                             );
@@ -952,7 +920,7 @@ where
             }
 
             if note.is_none() {
-                struct_span_err!(diagnostic, attr.span, E0543, "missing 'note'").emit();
+                sess.emit_err(session_diagnostics::MissingNote { span: attr.span });
                 continue;
             }
         }
@@ -1007,7 +975,7 @@ pub fn find_repr_attrs(sess: &Session, attr: &Attribute) -> Vec<ReprAttr> {
 }
 
 pub fn parse_repr_attr(sess: &Session, attr: &Attribute) -> Vec<ReprAttr> {
-    assert!(attr.has_name(sym::repr), "expected `#[repr(..)]`, found: {:?}", attr);
+    assert!(attr.has_name(sym::repr), "expected `#[repr(..)]`, found: {attr:?}");
     use ReprAttr::*;
     let mut acc = Vec::new();
     let diagnostic = &sess.parse_sess.span_diagnostic;
@@ -1022,19 +990,9 @@ pub fn parse_repr_attr(sess: &Session, attr: &Attribute) -> Vec<ReprAttr> {
                     sym::simd => Some(ReprSimd),
                     sym::transparent => Some(ReprTransparent),
                     sym::align => {
-                        let mut err = struct_span_err!(
-                            diagnostic,
-                            item.span(),
-                            E0589,
-                            "invalid `repr(align)` attribute: `align` needs an argument"
-                        );
-                        err.span_suggestion(
-                            item.span(),
-                            "supply an argument here",
-                            "align(...)",
-                            Applicability::HasPlaceholders,
-                        );
-                        err.emit();
+                        sess.emit_err(session_diagnostics::InvalidReprAlignNeedArg {
+                            span: item.span(),
+                        });
                         recognised = true;
                         None
                     }
@@ -1063,110 +1021,71 @@ pub fn parse_repr_attr(sess: &Session, attr: &Attribute) -> Vec<ReprAttr> {
                     || int_type_of_word(name).is_some()
                 {
                     recognised = true;
-                    struct_span_err!(
-                                diagnostic,
-                                item.span(),
-                                E0552,
-                                "invalid representation hint: `{}` does not take a parenthesized argument list",
-                                name.to_ident_string(),
-                            ).emit();
+                    sess.emit_err(session_diagnostics::InvalidReprHintNoParen {
+                        span: item.span(),
+                        name: name.to_ident_string(),
+                    });
                 }
                 if let Some(literal_error) = literal_error {
-                    struct_span_err!(
-                        diagnostic,
-                        item.span(),
-                        E0589,
-                        "invalid `repr({})` attribute: {}",
-                        name.to_ident_string(),
-                        literal_error
-                    )
-                    .emit();
+                    sess.emit_err(session_diagnostics::InvalidReprGeneric {
+                        span: item.span(),
+                        repr_arg: name.to_ident_string(),
+                        error_part: literal_error,
+                    });
                 }
             } else if let Some(meta_item) = item.meta_item() {
-                if let MetaItemKind::NameValue(ref value) = meta_item.kind {
-                    if meta_item.has_name(sym::align) || meta_item.has_name(sym::packed) {
-                        let name = meta_item.name_or_empty().to_ident_string();
-                        recognised = true;
-                        let mut err = struct_span_err!(
-                            diagnostic,
-                            item.span(),
-                            E0693,
-                            "incorrect `repr({})` attribute format",
-                            name,
-                        );
-                        match value.kind {
-                            ast::LitKind::Int(int, ast::LitIntType::Unsuffixed) => {
-                                err.span_suggestion(
+                match &meta_item.kind {
+                    MetaItemKind::NameValue(value) => {
+                        if meta_item.has_name(sym::align) || meta_item.has_name(sym::packed) {
+                            let name = meta_item.name_or_empty().to_ident_string();
+                            recognised = true;
+                            sess.emit_err(session_diagnostics::IncorrectReprFormatGeneric {
+                                span: item.span(),
+                                repr_arg: &name,
+                                cause: IncorrectReprFormatGenericCause::from_lit_kind(
                                     item.span(),
-                                    "use parentheses instead",
-                                    format!("{}({})", name, int),
-                                    Applicability::MachineApplicable,
-                                );
-                            }
-                            ast::LitKind::Str(s, _) => {
-                                err.span_suggestion(
-                                    item.span(),
-                                    "use parentheses instead",
-                                    format!("{}({})", name, s),
-                                    Applicability::MachineApplicable,
-                                );
-                            }
-                            _ => {}
-                        }
-                        err.emit();
-                    } else {
-                        if matches!(
+                                    &value.kind,
+                                    &name,
+                                ),
+                            });
+                        } else if matches!(
                             meta_item.name_or_empty(),
                             sym::C | sym::simd | sym::transparent
                         ) || int_type_of_word(meta_item.name_or_empty()).is_some()
                         {
                             recognised = true;
-                            struct_span_err!(
-                                diagnostic,
-                                meta_item.span,
-                                E0552,
-                                "invalid representation hint: `{}` does not take a value",
-                                meta_item.name_or_empty().to_ident_string(),
-                            )
-                            .emit();
+                            sess.emit_err(session_diagnostics::InvalidReprHintNoValue {
+                                span: meta_item.span,
+                                name: meta_item.name_or_empty().to_ident_string(),
+                            });
                         }
                     }
-                } else if let MetaItemKind::List(_) = meta_item.kind {
-                    if meta_item.has_name(sym::align) {
-                        recognised = true;
-                        struct_span_err!(
-                            diagnostic,
-                            meta_item.span,
-                            E0693,
-                            "incorrect `repr(align)` attribute format: \
-                                 `align` takes exactly one argument in parentheses"
-                        )
-                        .emit();
-                    } else if meta_item.has_name(sym::packed) {
-                        recognised = true;
-                        struct_span_err!(
-                            diagnostic,
-                            meta_item.span,
-                            E0552,
-                            "incorrect `repr(packed)` attribute format: \
-                                 `packed` takes exactly one parenthesized argument, \
-                                 or no parentheses at all"
-                        )
-                        .emit();
-                    } else if matches!(
-                        meta_item.name_or_empty(),
-                        sym::C | sym::simd | sym::transparent
-                    ) || int_type_of_word(meta_item.name_or_empty()).is_some()
-                    {
-                        recognised = true;
-                        struct_span_err!(
-                                diagnostic,
-                                meta_item.span,
-                                E0552,
-                                "invalid representation hint: `{}` does not take a parenthesized argument list",
-                                meta_item.name_or_empty().to_ident_string(),
-                            ).emit();
+                    MetaItemKind::List(_) => {
+                        if meta_item.has_name(sym::align) {
+                            recognised = true;
+                            sess.emit_err(session_diagnostics::IncorrectReprFormatAlignOneArg {
+                                span: meta_item.span,
+                            });
+                        } else if meta_item.has_name(sym::packed) {
+                            recognised = true;
+                            sess.emit_err(
+                                session_diagnostics::IncorrectReprFormatPackedOneOrZeroArg {
+                                    span: meta_item.span,
+                                },
+                            );
+                        } else if matches!(
+                            meta_item.name_or_empty(),
+                            sym::C | sym::simd | sym::transparent
+                        ) || int_type_of_word(meta_item.name_or_empty()).is_some()
+                        {
+                            recognised = true;
+                            sess.emit_err(session_diagnostics::InvalidReprHintNoParen {
+                                span: meta_item.span,
+                                name: meta_item.name_or_empty().to_ident_string(),
+                            });
+                        }
                     }
+                    _ => (),
                 }
             }
             if !recognised {
@@ -1262,10 +1181,10 @@ fn allow_unstable<'a>(
     let list = attrs
         .filter_map(move |attr| {
             attr.meta_item_list().or_else(|| {
-                sess.diagnostic().span_err(
-                    attr.span,
-                    &format!("`{}` expects a list of feature names", symbol.to_ident_string()),
-                );
+                sess.emit_err(session_diagnostics::ExpectsFeatureList {
+                    span: attr.span,
+                    name: symbol.to_ident_string(),
+                });
                 None
             })
         })
@@ -1274,10 +1193,10 @@ fn allow_unstable<'a>(
     list.into_iter().filter_map(move |it| {
         let name = it.ident().map(|ident| ident.name);
         if name.is_none() {
-            sess.diagnostic().span_err(
-                it.span(),
-                &format!("`{}` expects feature names", symbol.to_ident_string()),
-            );
+            sess.emit_err(session_diagnostics::ExpectsFeatures {
+                span: it.span(),
+                name: symbol.to_ident_string(),
+            });
         }
         name
     })

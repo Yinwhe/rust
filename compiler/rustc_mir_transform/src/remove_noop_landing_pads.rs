@@ -35,6 +35,7 @@ impl RemoveNoopLandingPads {
                 | StatementKind::StorageDead(_)
                 | StatementKind::AscribeUserType(..)
                 | StatementKind::Coverage(..)
+                | StatementKind::ConstEvalCounter
                 | StatementKind::Nop => {
                     // These are all noops in a landing pad
                 }
@@ -51,7 +52,7 @@ impl RemoveNoopLandingPads {
                 StatementKind::Assign { .. }
                 | StatementKind::SetDiscriminant { .. }
                 | StatementKind::Deinit(..)
-                | StatementKind::CopyNonOverlapping(..)
+                | StatementKind::Intrinsic(..)
                 | StatementKind::Retag { .. } => {
                     return false;
                 }
@@ -94,7 +95,7 @@ impl RemoveNoopLandingPads {
 
         let mut jumps_folded = 0;
         let mut landing_pads_removed = 0;
-        let mut nop_landing_pads = BitSet::new_empty(body.basic_blocks().len());
+        let mut nop_landing_pads = BitSet::new_empty(body.basic_blocks.len());
 
         // This is a post-order traversal, so that if A post-dominates B
         // then A will be visited before B.

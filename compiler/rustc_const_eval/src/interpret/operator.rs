@@ -1,5 +1,3 @@
-use std::convert::TryFrom;
-
 use rustc_apfloat::Float;
 use rustc_middle::mir;
 use rustc_middle::mir::interpret::{InterpResult, Scalar};
@@ -38,7 +36,7 @@ impl<'mir, 'tcx: 'mir, M: Machine<'mir, 'tcx>> InterpCx<'mir, 'tcx, M> {
         if let Abi::ScalarPair(..) = dest.layout.abi {
             // We can use the optimized path and avoid `place_field` (which might do
             // `force_allocation`).
-            let pair = Immediate::ScalarPair(val.into(), Scalar::from_bool(overflowed).into());
+            let pair = Immediate::ScalarPair(val, Scalar::from_bool(overflowed));
             self.write_immediate(pair, dest)?;
         } else {
             assert!(self.tcx.sess.opts.unstable_opts.randomize_layout);
@@ -329,21 +327,21 @@ impl<'mir, 'tcx: 'mir, M: Machine<'mir, 'tcx>> InterpCx<'mir, 'tcx, M> {
         match left.layout.ty.kind() {
             ty::Char => {
                 assert_eq!(left.layout.ty, right.layout.ty);
-                let left = left.to_scalar()?;
-                let right = right.to_scalar()?;
+                let left = left.to_scalar();
+                let right = right.to_scalar();
                 Ok(self.binary_char_op(bin_op, left.to_char()?, right.to_char()?))
             }
             ty::Bool => {
                 assert_eq!(left.layout.ty, right.layout.ty);
-                let left = left.to_scalar()?;
-                let right = right.to_scalar()?;
+                let left = left.to_scalar();
+                let right = right.to_scalar();
                 Ok(self.binary_bool_op(bin_op, left.to_bool()?, right.to_bool()?))
             }
             ty::Float(fty) => {
                 assert_eq!(left.layout.ty, right.layout.ty);
                 let ty = left.layout.ty;
-                let left = left.to_scalar()?;
-                let right = right.to_scalar()?;
+                let left = left.to_scalar();
+                let right = right.to_scalar();
                 Ok(match fty {
                     FloatTy::F32 => {
                         self.binary_float_op(bin_op, ty, left.to_f32()?, right.to_f32()?)
@@ -363,8 +361,8 @@ impl<'mir, 'tcx: 'mir, M: Machine<'mir, 'tcx>> InterpCx<'mir, 'tcx, M> {
                     right.layout.ty
                 );
 
-                let l = left.to_scalar()?.to_bits(left.layout.size)?;
-                let r = right.to_scalar()?.to_bits(right.layout.size)?;
+                let l = left.to_scalar().to_bits(left.layout.size)?;
+                let r = right.to_scalar().to_bits(right.layout.size)?;
                 self.binary_int_op(bin_op, l, left.layout, r, right.layout)
             }
             _ if left.layout.ty.is_any_ptr() => {
@@ -410,7 +408,7 @@ impl<'mir, 'tcx: 'mir, M: Machine<'mir, 'tcx>> InterpCx<'mir, 'tcx, M> {
         use rustc_middle::mir::UnOp::*;
 
         let layout = val.layout;
-        let val = val.to_scalar()?;
+        let val = val.to_scalar();
         trace!("Running unary op {:?}: {:?} ({:?})", un_op, val, layout.ty);
 
         match layout.ty.kind() {

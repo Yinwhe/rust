@@ -75,6 +75,27 @@ export const expandMacro = new lc.RequestType<ExpandMacroParams, ExpandedMacro |
     "rust-analyzer/expandMacro"
 );
 
+export const relatedTests = new lc.RequestType<lc.TextDocumentPositionParams, TestInfo[], void>(
+    "rust-analyzer/relatedTests"
+);
+
+export const cancelFlycheck = new lc.NotificationType0("rust-analyzer/cancelFlycheck");
+export const clearFlycheck = new lc.NotificationType0("rust-analyzer/clearFlycheck");
+export const runFlycheck = new lc.NotificationType<{
+    textDocument: lc.TextDocumentIdentifier | null;
+}>("rust-analyzer/runFlycheck");
+
+// Experimental extensions
+
+export interface SsrParams {
+    query: string;
+    parseOnly: boolean;
+    textDocument: lc.TextDocumentIdentifier;
+    position: lc.Position;
+    selections: readonly lc.Range[];
+}
+export const ssr = new lc.RequestType<SsrParams, lc.WorkspaceEdit, void>("experimental/ssr");
+
 export interface MatchingBraceParams {
     textDocument: lc.TextDocumentIdentifier;
     positions: lc.Position[];
@@ -126,19 +147,6 @@ export const runnables = new lc.RequestType<RunnablesParams, Runnable[], void>(
 export interface TestInfo {
     runnable: Runnable;
 }
-
-export const relatedTests = new lc.RequestType<lc.TextDocumentPositionParams, TestInfo[], void>(
-    "rust-analyzer/relatedTests"
-);
-
-export interface SsrParams {
-    query: string;
-    parseOnly: boolean;
-    textDocument: lc.TextDocumentIdentifier;
-    position: lc.Position;
-    selections: readonly lc.Range[];
-}
-export const ssr = new lc.RequestType<SsrParams, lc.WorkspaceEdit, void>("experimental/ssr");
 
 export interface CommandLink extends lc.Command {
     /**

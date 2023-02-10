@@ -9,9 +9,9 @@ use std::{
 
 use anyhow::Context;
 use ide::{
-    AnnotationConfig, AssistKind, AssistResolveStrategy, FileId, FilePosition, FileRange,
-    HoverAction, HoverGotoTypeData, Query, RangeInfo, Runnable, RunnableKind, SingleResolve,
-    SourceChange, TextEdit,
+    AnnotationConfig, AssistKind, AssistResolveStrategy, Cancellable, FileId, FilePosition,
+    FileRange, HoverAction, HoverGotoTypeData, Query, RangeInfo, ReferenceCategory, Runnable,
+    RunnableKind, SingleResolve, SourceChange, TextEdit,
 };
 use ide_db::SymbolKind;
 use lsp_server::ErrorCode;
@@ -28,7 +28,8 @@ use lsp_types::{
 use project_model::{ManifestPath, ProjectWorkspace, TargetKind};
 use serde_json::json;
 use stdx::{format_to, never};
-use syntax::{algo, ast, AstNode, TextRange, TextSize, T};
+use syntax::{algo, ast, AstNode, TextRange, TextSize};
+use tracing::error;
 use vfs::AbsPathBuf;
 
 use crate::{
@@ -48,6 +49,12 @@ pub(crate) fn handle_workspace_reload(state: &mut GlobalState, _: ()) -> Result<
     state.proc_macro_changed = false;
     state.fetch_workspaces_queue.request_op("reload workspace request".to_string());
     state.fetch_build_data_queue.request_op("reload workspace request".to_string());
+    Ok(())
+}
+
+pub(crate) fn handle_cancel_flycheck(state: &mut GlobalState, _: ()) -> Result<()> {
+    let _p = profile::span("handle_stop_flycheck");
+    state.flycheck.iter().for_each(|flycheck| flycheck.cancel());
     Ok(())
 }
 
@@ -550,7 +557,7 @@ pub(crate) fn handle_will_rename_files(
     if source_change.source_file_edits.is_empty() {
         Ok(None)
     } else {
-        to_proto::workspace_edit(&snap, source_change).map(Some)
+        Ok(Some(to_proto::workspace_edit(&snap, source_change)?))
     }
 }
 
@@ -652,7 +659,7 @@ pub(crate) fn handle_parent_module(
 
         // check if invoked at the crate root
         let file_id = from_proto::file_id(&snap, &params.text_document.uri)?;
-        let crate_id = match snap.analysis.crate_for(file_id)?.first() {
+        let crate_id = match snap.analysis.crates_for(file_id)?.first() {
             Some(&crate_id) => crate_id,
             None => return Ok(None),
         };
@@ -703,10 +710,8 @@ pub(crate) fn handle_runnables(
 
     let mut res = Vec::new();
     for runnable in snap.analysis.runnables(file_id)? {
-        if let Some(offset) = offset {
-            if !runnable.nav.full_range.contains_inclusive(offset) {
-                continue;
-            }
+        if should_skip_for_offset(&runnable, offset) {
+            continue;
         }
         if should_skip_target(&runnable, cargo_spec.as_ref()) {
             continue;
@@ -725,7 +730,7 @@ pub(crate) fn handle_runnables(
         Some(spec) => {
             for cmd in ["check", "test"] {
                 res.push(lsp_ext::Runnable {
-                    label: format!("cargo {} -p {} --all-targets", cmd, spec.package),
+                    label: format!("cargo {cmd} -p {} --all-targets", spec.package),
                     location: None,
                     kind: lsp_ext::RunnableKind::Cargo,
                     args: lsp_ext::CargoRunnable {
@@ -772,6 +777,14 @@ pub(crate) fn handle_runnables(
     Ok(res)
 }
 
+fn should_skip_for_offset(runnable: &Runnable, offset: Option<TextSize>) -> bool {
+    match offset {
+        None => false,
+        _ if matches!(&runnable.kind, RunnableKind::TestMod { .. }) => false,
+        Some(offset) => !runnable.nav.full_range.contains_inclusive(offset),
+    }
+}
+
 pub(crate) fn handle_related_tests(
     snap: GlobalStateSnapshot,
     params: lsp_types::TextDocumentPositionParams,
@@ -799,18 +812,6 @@ pub(crate) fn handle_completion(
     let position = from_proto::file_position(&snap, params.text_document_position)?;
     let completion_trigger_character =
         params.context.and_then(|ctx| ctx.trigger_character).and_then(|s| s.chars().next());
-
-    if Some(':') == completion_trigger_character {
-        let source_file = snap.analysis.parse(position.file_id)?;
-        let left_token = source_file.syntax().token_at_offset(position.offset).left_biased();
-        let completion_triggered_after_single_colon = match left_token {
-            Some(left_token) => left_token.kind() == T![:],
-            None => true,
-        };
-        if completion_triggered_after_single_colon {
-            return Ok(None);
-        }
-    }
 
     let completion_config = &snap.config.completion();
     let items = match snap.analysis.completions(
@@ -898,7 +899,7 @@ pub(crate) fn handle_folding_range(
     let line_folding_only = snap.config.line_folding_only();
     let res = folds
         .into_iter()
-        .map(|it| to_proto::folding_range(&*text, &line_index, line_folding_only, it))
+        .map(|it| to_proto::folding_range(&text, &line_index, line_folding_only, it))
         .collect();
     Ok(Some(res))
 }
@@ -978,7 +979,7 @@ pub(crate) fn handle_rename(
     let position = from_proto::file_position(&snap, params.text_document_position)?;
 
     let mut change =
-        snap.analysis.rename(position, &*params.new_name)?.map_err(to_proto::rename_error)?;
+        snap.analysis.rename(position, &params.new_name)?.map_err(to_proto::rename_error)?;
 
     // this is kind of a hack to prevent double edits from happening when moving files
     // When a module gets renamed by renaming the mod declaration this causes the file to move
@@ -1000,6 +1001,8 @@ pub(crate) fn handle_references(
     let _p = profile::span("handle_references");
     let position = from_proto::file_position(&snap, params.text_document_position)?;
 
+    let exclude_imports = snap.config.find_all_refs_exclude_imports();
+
     let refs = match snap.analysis.find_all_refs(position, None)? {
         None => return Ok(None),
         Some(refs) => refs,
@@ -1020,7 +1023,11 @@ pub(crate) fn handle_references(
             refs.references
                 .into_iter()
                 .flat_map(|(file_id, refs)| {
-                    refs.into_iter().map(move |(range, _)| FileRange { file_id, range })
+                    refs.into_iter()
+                        .filter(|&(_, category)| {
+                            !exclude_imports || category != Some(ReferenceCategory::Import)
+                        })
+                        .map(move |(range, _)| FileRange { file_id, range })
                 })
                 .chain(decl)
         })
@@ -1094,9 +1101,7 @@ pub(crate) fn handle_code_action(
     }
 
     // Fixes from `cargo check`.
-    for fix in
-        snap.check_fixes.values().filter_map(|it| it.get(&frange.file_id)).into_iter().flatten()
-    {
+    for fix in snap.check_fixes.values().filter_map(|it| it.get(&frange.file_id)).flatten() {
         // FIXME: this mapping is awkward and shouldn't exist. Refactor
         // `snap.check_fixes` to not convert to LSP prematurely.
         let intersect_fix_range = fix
@@ -1139,8 +1144,8 @@ pub(crate) fn handle_code_action_resolve(
         Ok(parsed_data) => parsed_data,
         Err(e) => {
             return Err(invalid_params_error(format!(
-                "Failed to parse action id string '{}': {}",
-                params.id, e
+                "Failed to parse action id string '{}': {e}",
+                params.id
             ))
             .into())
         }
@@ -1184,7 +1189,7 @@ fn parse_action_id(action_id: &str) -> Result<(usize, SingleResolve), String> {
             let assist_kind: AssistKind = assist_kind_string.parse()?;
             let index: usize = match index_string.parse() {
                 Ok(index) => index,
-                Err(e) => return Err(format!("Incorrect index string: {}", e)),
+                Err(e) => return Err(format!("Incorrect index string: {e}")),
             };
             Ok((index, SingleResolve { assist_id: assist_id_string.to_string(), assist_kind }))
         }
@@ -1222,6 +1227,7 @@ pub(crate) fn handle_code_lens(
             annotate_references: lens_config.refs_adt,
             annotate_method_references: lens_config.method_refs,
             annotate_enum_variant_references: lens_config.enum_variant_refs,
+            location: lens_config.location.into(),
         },
         file_id,
     )?;
@@ -1271,7 +1277,7 @@ pub(crate) fn handle_document_highlight(
         .into_iter()
         .map(|ide::HighlightedRange { range, category }| lsp_types::DocumentHighlight {
             range: to_proto::range(&line_index, range),
-            kind: category.map(to_proto::document_highlight_kind),
+            kind: category.and_then(to_proto::document_highlight_kind),
         })
         .collect();
     Ok(Some(res))
@@ -1294,7 +1300,7 @@ pub(crate) fn handle_ssr(
         position,
         selections,
     )??;
-    to_proto::workspace_edit(&snap, source_change)
+    to_proto::workspace_edit(&snap, source_change).map_err(Into::into)
 }
 
 pub(crate) fn publish_diagnostics(
@@ -1335,13 +1341,12 @@ pub(crate) fn handle_inlay_hints(
 ) -> Result<Option<Vec<InlayHint>>> {
     let _p = profile::span("handle_inlay_hints");
     let document_uri = &params.text_document.uri;
-    let file_id = from_proto::file_id(&snap, document_uri)?;
-    let line_index = snap.file_line_index(file_id)?;
-    let range = from_proto::file_range(
+    let FileRange { file_id, range } = from_proto::file_range(
         &snap,
         TextDocumentIdentifier::new(document_uri.to_owned()),
         params.range,
     )?;
+    let line_index = snap.file_line_index(file_id)?;
     let inlay_hints_config = snap.config.inlay_hints();
     Ok(Some(
         snap.analysis
@@ -1350,7 +1355,7 @@ pub(crate) fn handle_inlay_hints(
             .map(|it| {
                 to_proto::inlay_hint(&snap, &line_index, inlay_hints_config.render_colons, it)
             })
-            .collect(),
+            .collect::<Cancellable<Vec<_>>>()?,
     ))
 }
 
@@ -1366,9 +1371,26 @@ pub(crate) fn handle_inlay_hints_resolve(
 
     let resolve_data: lsp_ext::InlayHintResolveData = serde_json::from_value(data)?;
 
-    let file_range = from_proto::file_range(
+    match snap.url_file_version(&resolve_data.text_document.uri) {
+        Some(version) if version == resolve_data.text_document.version => {}
+        Some(version) => {
+            error!(
+                "attempted inlayHints/resolve of '{}' at version {} while server version is {}",
+                resolve_data.text_document.uri, resolve_data.text_document.version, version,
+            );
+            return Ok(hint);
+        }
+        None => {
+            error!(
+                "attempted inlayHints/resolve of unknown file '{}' at version {}",
+                resolve_data.text_document.uri, resolve_data.text_document.version,
+            );
+            return Ok(hint);
+        }
+    }
+    let file_range = from_proto::file_range_uri(
         &snap,
-        resolve_data.text_document,
+        &resolve_data.text_document.uri,
         match resolve_data.position {
             PositionOrRange::Position(pos) => Range::new(pos, pos),
             PositionOrRange::Range(range) => range,
@@ -1407,7 +1429,7 @@ pub(crate) fn handle_call_hierarchy_prepare(
         .into_iter()
         .filter(|it| it.kind == Some(SymbolKind::Function))
         .map(|it| to_proto::call_hierarchy_item(&snap, it))
-        .collect::<Result<Vec<_>>>()?;
+        .collect::<Cancellable<Vec<_>>>()?;
 
     Ok(Some(res))
 }
@@ -1492,10 +1514,12 @@ pub(crate) fn handle_semantic_tokens_full(
     let text = snap.analysis.file_text(file_id)?;
     let line_index = snap.file_line_index(file_id)?;
 
-    let highlights = snap.analysis.highlight(file_id)?;
-    let highlight_strings = snap.config.highlighting_strings();
-    let semantic_tokens =
-        to_proto::semantic_tokens(&text, &line_index, highlights, highlight_strings);
+    let mut highlight_config = snap.config.highlighting_config();
+    // Avoid flashing a bunch of unresolved references when the proc-macro servers haven't been spawned yet.
+    highlight_config.syntactic_name_ref_highlighting = !snap.proc_macros_loaded;
+
+    let highlights = snap.analysis.highlight(highlight_config, file_id)?;
+    let semantic_tokens = to_proto::semantic_tokens(&text, &line_index, highlights);
 
     // Unconditionally cache the tokens
     snap.semantic_tokens_cache.lock().insert(params.text_document.uri, semantic_tokens.clone());
@@ -1513,10 +1537,12 @@ pub(crate) fn handle_semantic_tokens_full_delta(
     let text = snap.analysis.file_text(file_id)?;
     let line_index = snap.file_line_index(file_id)?;
 
-    let highlights = snap.analysis.highlight(file_id)?;
-    let highlight_strings = snap.config.highlighting_strings();
-    let semantic_tokens =
-        to_proto::semantic_tokens(&text, &line_index, highlights, highlight_strings);
+    let mut highlight_config = snap.config.highlighting_config();
+    // Avoid flashing a bunch of unresolved references when the proc-macro servers haven't been spawned yet.
+    highlight_config.syntactic_name_ref_highlighting = !snap.proc_macros_loaded;
+
+    let highlights = snap.analysis.highlight(highlight_config, file_id)?;
+    let semantic_tokens = to_proto::semantic_tokens(&text, &line_index, highlights);
 
     let mut cache = snap.semantic_tokens_cache.lock();
     let cached_tokens = cache.entry(params.text_document.uri).or_default();
@@ -1544,10 +1570,8 @@ pub(crate) fn handle_semantic_tokens_range(
     let text = snap.analysis.file_text(frange.file_id)?;
     let line_index = snap.file_line_index(frange.file_id)?;
 
-    let highlights = snap.analysis.highlight_range(frange)?;
-    let highlight_strings = snap.config.highlighting_strings();
-    let semantic_tokens =
-        to_proto::semantic_tokens(&text, &line_index, highlights, highlight_strings);
+    let highlights = snap.analysis.highlight_range(snap.config.highlighting_config(), frange)?;
+    let semantic_tokens = to_proto::semantic_tokens(&text, &line_index, highlights);
     Ok(Some(semantic_tokens.into()))
 }
 
@@ -1761,13 +1785,23 @@ fn run_rustfmt(
 ) -> Result<Option<Vec<lsp_types::TextEdit>>> {
     let file_id = from_proto::file_id(snap, &text_document.uri)?;
     let file = snap.analysis.file_text(file_id)?;
-    let crate_ids = snap.analysis.crate_for(file_id)?;
+
+    // Determine the edition of the crate the file belongs to (if there's multiple, we pick the
+    // highest edition).
+    let editions = snap
+        .analysis
+        .relevant_crates_for(file_id)?
+        .into_iter()
+        .map(|crate_id| snap.analysis.crate_edition(crate_id))
+        .collect::<Result<Vec<_>, _>>()?;
+    let edition = editions.iter().copied().max();
 
     let line_index = snap.file_line_index(file_id)?;
 
-    let mut rustfmt = match snap.config.rustfmt() {
+    let mut command = match snap.config.rustfmt() {
         RustfmtConfig::Rustfmt { extra_args, enable_range_formatting } => {
             let mut cmd = process::Command::new(toolchain::rustfmt());
+            cmd.envs(snap.config.extra_env());
             cmd.args(extra_args);
             // try to chdir to the file so we can respect `rustfmt.toml`
             // FIXME: use `rustfmt --config-path` once
@@ -1786,9 +1820,7 @@ fn run_rustfmt(
                     );
                 }
             }
-            if let Some(&crate_id) = crate_ids.first() {
-                // Assume all crates are in the same edition
-                let edition = snap.analysis.crate_edition(crate_id)?;
+            if let Some(edition) = edition {
                 cmd.arg("--edition");
                 cmd.arg(edition.to_string());
             }
@@ -1825,17 +1857,18 @@ fn run_rustfmt(
         }
         RustfmtConfig::CustomCommand { command, args } => {
             let mut cmd = process::Command::new(command);
+            cmd.envs(snap.config.extra_env());
             cmd.args(args);
             cmd
         }
     };
 
-    let mut rustfmt = rustfmt
+    let mut rustfmt = command
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
-        .context(format!("Failed to spawn {:?}", rustfmt))?;
+        .context(format!("Failed to spawn {command:?}"))?;
 
     rustfmt.stdin.as_mut().unwrap().write_all(file.as_bytes())?;
 
@@ -1854,7 +1887,11 @@ fn run_rustfmt(
                 // formatting because otherwise an error is surfaced to the user on top of the
                 // syntax error diagnostics they're already receiving. This is especially jarring
                 // if they have format on save enabled.
-                tracing::info!("rustfmt exited with status 1, assuming parse error and ignoring");
+                tracing::warn!(
+                    ?command,
+                    %captured_stderr,
+                    "rustfmt exited with status 1"
+                );
                 Ok(None)
             }
             _ => {
@@ -1864,9 +1901,9 @@ fn run_rustfmt(
                     format!(
                         r#"rustfmt exited with:
                            Status: {}
-                           stdout: {}
-                           stderr: {}"#,
-                        output.status, captured_stdout, captured_stderr,
+                           stdout: {captured_stdout}
+                           stderr: {captured_stderr}"#,
+                        output.status,
                     ),
                 )
                 .into())

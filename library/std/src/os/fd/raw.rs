@@ -42,10 +42,8 @@ pub trait AsRawFd {
     /// ```no_run
     /// use std::fs::File;
     /// # use std::io;
-    /// #[cfg(unix)]
-    /// use std::os::unix::io::{AsRawFd, RawFd};
-    /// #[cfg(target_os = "wasi")]
-    /// use std::os::wasi::io::{AsRawFd, RawFd};
+    /// #[cfg(any(unix, target_os = "wasi"))]
+    /// use std::os::fd::{AsRawFd, RawFd};
     ///
     /// let mut f = File::open("foo.txt")?;
     /// // Note that `raw_fd` is only valid as long as `f` exists.
@@ -83,10 +81,8 @@ pub trait FromRawFd {
     /// ```no_run
     /// use std::fs::File;
     /// # use std::io;
-    /// #[cfg(unix)]
-    /// use std::os::unix::io::{FromRawFd, IntoRawFd, RawFd};
-    /// #[cfg(target_os = "wasi")]
-    /// use std::os::wasi::io::{FromRawFd, IntoRawFd, RawFd};
+    /// #[cfg(any(unix, target_os = "wasi"))]
+    /// use std::os::fd::{FromRawFd, IntoRawFd, RawFd};
     ///
     /// let f = File::open("foo.txt")?;
     /// # #[cfg(any(unix, target_os = "wasi"))]
@@ -121,10 +117,8 @@ pub trait IntoRawFd {
     /// ```no_run
     /// use std::fs::File;
     /// # use std::io;
-    /// #[cfg(unix)]
-    /// use std::os::unix::io::{IntoRawFd, RawFd};
-    /// #[cfg(target_os = "wasi")]
-    /// use std::os::wasi::io::{IntoRawFd, RawFd};
+    /// #[cfg(any(unix, target_os = "wasi"))]
+    /// use std::os::fd::{IntoRawFd, RawFd};
     ///
     /// let f = File::open("foo.txt")?;
     /// #[cfg(any(unix, target_os = "wasi"))]
@@ -244,6 +238,14 @@ impl<'a> AsRawFd for io::StderrLock<'a> {
 /// ```
 #[stable(feature = "asrawfd_ptrs", since = "1.63.0")]
 impl<T: AsRawFd> AsRawFd for crate::sync::Arc<T> {
+    #[inline]
+    fn as_raw_fd(&self) -> RawFd {
+        (**self).as_raw_fd()
+    }
+}
+
+#[stable(feature = "asfd_rc", since = "CURRENT_RUSTC_VERSION")]
+impl<T: AsRawFd> AsRawFd for crate::rc::Rc<T> {
     #[inline]
     fn as_raw_fd(&self) -> RawFd {
         (**self).as_raw_fd()

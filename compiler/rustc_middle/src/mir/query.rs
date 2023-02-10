@@ -2,7 +2,7 @@
 
 use crate::mir::{Body, ConstantKind, Promoted};
 use crate::ty::{self, OpaqueHiddenType, Ty, TyCtxt};
-use rustc_data_structures::fx::FxHashMap;
+use rustc_data_structures::fx::FxHashSet;
 use rustc_data_structures::vec_map::VecMap;
 use rustc_errors::ErrorGuaranteed;
 use rustc_hir as hir;
@@ -115,21 +115,6 @@ pub enum UnusedUnsafe {
     /// `unsafe` block nested under another (used) `unsafe` block
     /// > ``… because it's nested under this `unsafe` block``
     InUnsafeBlock(hir::HirId),
-    /// `unsafe` block nested under `unsafe fn`
-    /// > ``… because it's nested under this `unsafe fn` ``
-    ///
-    /// the second HirId here indicates the first usage of the `unsafe` block,
-    /// which allows retrieval of the LintLevelSource for why that operation would
-    /// have been permitted without the block
-    InUnsafeFn(hir::HirId, hir::HirId),
-}
-
-#[derive(Copy, Clone, PartialEq, TyEncodable, TyDecodable, HashStable, Debug)]
-pub enum UsedUnsafeBlockData {
-    SomeDisallowedInUnsafeFn,
-    // the HirId here indicates the first usage of the `unsafe` block
-    // (i.e. the one that's first encountered in the MIR traversal of the unsafety check)
-    AllAllowedInUnsafeFn(hir::HirId),
 }
 
 #[derive(TyEncodable, TyDecodable, HashStable, Debug)]
@@ -138,27 +123,32 @@ pub struct UnsafetyCheckResult {
     pub violations: Vec<UnsafetyViolation>,
 
     /// Used `unsafe` blocks in this function. This is used for the "unused_unsafe" lint.
-    ///
-    /// The keys are the used `unsafe` blocks, the UnusedUnsafeKind indicates whether
-    /// or not any of the usages happen at a place that doesn't allow `unsafe_op_in_unsafe_fn`.
-    pub used_unsafe_blocks: FxHashMap<hir::HirId, UsedUnsafeBlockData>,
+    pub used_unsafe_blocks: FxHashSet<hir::HirId>,
 
     /// This is `Some` iff the item is not a closure.
     pub unused_unsafes: Option<Vec<(hir::HirId, UnusedUnsafe)>>,
 }
 
 rustc_index::newtype_index! {
-    pub struct GeneratorSavedLocal {
-        derive [HashStable]
-        DEBUG_FORMAT = "_{}",
-    }
+    #[derive(HashStable)]
+    #[debug_format = "_{}"]
+    pub struct GeneratorSavedLocal {}
+}
+
+#[derive(Clone, Debug, TyEncodable, TyDecodable, HashStable, TypeFoldable, TypeVisitable)]
+pub struct GeneratorSavedTy<'tcx> {
+    pub ty: Ty<'tcx>,
+    /// Source info corresponding to the local in the original MIR body.
+    pub source_info: SourceInfo,
+    /// Whether the local should be ignored for trait bound computations.
+    pub ignore_for_traits: bool,
 }
 
 /// The layout of generator state.
 #[derive(Clone, TyEncodable, TyDecodable, HashStable, TypeFoldable, TypeVisitable)]
 pub struct GeneratorLayout<'tcx> {
     /// The type of every local stored inside the generator.
-    pub field_tys: IndexVec<GeneratorSavedLocal, Ty<'tcx>>,
+    pub field_tys: IndexVec<GeneratorSavedLocal, GeneratorSavedTy<'tcx>>,
 
     /// Which of the above fields are in each variant. Note that one field may
     /// be stored in multiple variants.
@@ -345,7 +335,7 @@ rustc_data_structures::static_assert_size!(ConstraintCategory<'_>, 16);
 ///
 /// See also `rustc_const_eval::borrow_check::constraints`.
 #[derive(Copy, Clone, Debug, Eq, PartialEq, PartialOrd, Ord, Hash)]
-#[derive(TyEncodable, TyDecodable, HashStable)]
+#[derive(TyEncodable, TyDecodable, HashStable, Lift, TypeVisitable, TypeFoldable)]
 pub enum ConstraintCategory<'tcx> {
     Return(ReturnConstraint),
     Yield,
@@ -387,7 +377,7 @@ pub enum ConstraintCategory<'tcx> {
 }
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq, PartialOrd, Ord, Hash)]
-#[derive(TyEncodable, TyDecodable, HashStable)]
+#[derive(TyEncodable, TyDecodable, HashStable, TypeVisitable, TypeFoldable)]
 pub enum ReturnConstraint {
     Normal,
     ClosureUpvar(Field),
@@ -410,16 +400,9 @@ pub enum ClosureOutlivesSubject<'tcx> {
     Region(ty::RegionVid),
 }
 
-/// The constituent parts of a type level constant of kind ADT or array.
-#[derive(Copy, Clone, Debug, HashStable)]
-pub struct DestructuredConst<'tcx> {
-    pub variant: Option<VariantIdx>,
-    pub fields: &'tcx [ty::Const<'tcx>],
-}
-
 /// The constituent parts of a mir constant of kind ADT or array.
 #[derive(Copy, Clone, Debug, HashStable)]
-pub struct DestructuredMirConstant<'tcx> {
+pub struct DestructuredConstant<'tcx> {
     pub variant: Option<VariantIdx>,
     pub fields: &'tcx [ConstantKind<'tcx>],
 }

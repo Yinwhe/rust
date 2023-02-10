@@ -91,9 +91,7 @@ fn build_c_style_enum_di_node<'ll, 'tcx>(
             tag_base_type(cx, enum_type_and_layout),
             enum_adt_def.discriminants(cx.tcx).map(|(variant_index, discr)| {
                 let name = Cow::from(enum_adt_def.variant(variant_index).name.as_str());
-                // Is there anything we can do to support 128-bit C-Style enums?
-                let value = discr.val as u64;
-                (name, value)
+                (name, discr.val)
             }),
             containing_scope,
         ),
@@ -124,7 +122,8 @@ fn tag_base_type<'ll, 'tcx>(
                 Primitive::Int(t, _) => t,
                 Primitive::F32 => Integer::I32,
                 Primitive::F64 => Integer::I64,
-                Primitive::Pointer => {
+                // FIXME(erikdesjardins): handle non-default addrspace ptr sizes
+                Primitive::Pointer(_) => {
                     // If the niche is the NULL value of a reference, then `discr_enum_ty` will be
                     // a RawPtr. CodeView doesn't know what to do with enums whose base type is a
                     // pointer so we fix this up to just be `usize`.
@@ -147,14 +146,11 @@ fn tag_base_type<'ll, 'tcx>(
 /// This is a helper function and does not register anything in the type map by itself.
 ///
 /// `variants` is an iterator of (discr-value, variant-name).
-///
-// NOTE: Handling of discriminant values is somewhat inconsistent. They can appear as u128,
-//       u64, and i64. Here everything gets mapped to i64 because that's what LLVM's API expects.
 fn build_enumeration_type_di_node<'ll, 'tcx>(
     cx: &CodegenCx<'ll, 'tcx>,
     type_name: &str,
     base_type: Ty<'tcx>,
-    enumerators: impl Iterator<Item = (Cow<'tcx, str>, u64)>,
+    enumerators: impl Iterator<Item = (Cow<'tcx, str>, u128)>,
     containing_scope: &'ll DIType,
 ) -> &'ll DIType {
     let is_unsigned = match base_type.kind() {
@@ -162,20 +158,21 @@ fn build_enumeration_type_di_node<'ll, 'tcx>(
         ty::Uint(_) => true,
         _ => bug!("build_enumeration_type_di_node() called with non-integer tag type."),
     };
+    let (size, align) = cx.size_and_align_of(base_type);
 
     let enumerator_di_nodes: SmallVec<Option<&'ll DIType>> = enumerators
         .map(|(name, value)| unsafe {
+            let value = [value as u64, (value >> 64) as u64];
             Some(llvm::LLVMRustDIBuilderCreateEnumerator(
                 DIB(cx),
                 name.as_ptr().cast(),
                 name.len(),
-                value as i64,
+                value.as_ptr(),
+                size.bits() as libc::c_uint,
                 is_unsigned,
             ))
         })
         .collect();
-
-    let (size, align) = cx.size_and_align_of(base_type);
 
     unsafe {
         llvm::LLVMRustDIBuilderCreateEnumerationType(
@@ -273,7 +270,7 @@ fn build_enum_variant_struct_type_di_node<'ll, 'tcx>(
         |cx, struct_type_di_node| {
             (0..variant_layout.fields.count())
                 .map(|field_index| {
-                    let field_name = if variant_def.ctor_kind != CtorKind::Fn {
+                    let field_name = if variant_def.ctor_kind() != Some(CtorKind::Fn) {
                         // Fields have names
                         Cow::from(variant_def.fields[field_index].name.as_str())
                     } else {
@@ -417,7 +414,7 @@ impl DiscrResult {
 /// Returns the discriminant value corresponding to the variant index.
 ///
 /// Will return `None` if there is less than two variants (because then the enum won't have)
-/// a tag, and if this is the dataful variant of a niche-layout enum (because then there is no
+/// a tag, and if this is the untagged variant of a niche-layout enum (because then there is no
 /// single discriminant value).
 fn compute_discriminant_value<'ll, 'tcx>(
     cx: &CodegenCx<'ll, 'tcx>,
@@ -430,11 +427,11 @@ fn compute_discriminant_value<'ll, 'tcx>(
             enum_type_and_layout.ty.discriminant_for_variant(cx.tcx, variant_index).unwrap().val,
         ),
         &Variants::Multiple {
-            tag_encoding: TagEncoding::Niche { ref niche_variants, niche_start, dataful_variant },
+            tag_encoding: TagEncoding::Niche { ref niche_variants, niche_start, untagged_variant },
             tag,
             ..
         } => {
-            if variant_index == dataful_variant {
+            if variant_index == untagged_variant {
                 let valid_range = enum_type_and_layout
                     .for_variant(cx, variant_index)
                     .largest_niche

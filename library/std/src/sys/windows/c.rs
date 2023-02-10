@@ -56,6 +56,7 @@ pub type LPPROCESS_INFORMATION = *mut PROCESS_INFORMATION;
 pub type LPSECURITY_ATTRIBUTES = *mut SECURITY_ATTRIBUTES;
 pub type LPSTARTUPINFO = *mut STARTUPINFO;
 pub type LPVOID = *mut c_void;
+pub type LPCVOID = *const c_void;
 pub type LPWCH = *mut WCHAR;
 pub type LPWIN32_FIND_DATAW = *mut WIN32_FIND_DATAW;
 pub type LPWSADATA = *mut WSADATA;
@@ -66,10 +67,12 @@ pub type LPSYSTEM_INFO = *mut SYSTEM_INFO;
 pub type LPWSABUF = *mut WSABUF;
 pub type LPWSAOVERLAPPED = *mut c_void;
 pub type LPWSAOVERLAPPED_COMPLETION_ROUTINE = *mut c_void;
+pub type BCRYPT_ALG_HANDLE = LPVOID;
 
 pub type PCONDITION_VARIABLE = *mut CONDITION_VARIABLE;
 pub type PLARGE_INTEGER = *mut c_longlong;
 pub type PSRWLOCK = *mut SRWLOCK;
+pub type LPINIT_ONCE = *mut INIT_ONCE;
 
 pub type SOCKET = crate::os::windows::raw::SOCKET;
 pub type socklen_t = c_int;
@@ -124,6 +127,10 @@ pub const FILE_FLAG_BACKUP_SEMANTICS: DWORD = 0x02000000;
 pub const SECURITY_SQOS_PRESENT: DWORD = 0x00100000;
 
 pub const FIONBIO: c_ulong = 0x8004667e;
+
+pub const MAX_PATH: usize = 260;
+
+pub const FILE_TYPE_PIPE: u32 = 3;
 
 #[repr(C)]
 #[derive(Copy)]
@@ -193,6 +200,9 @@ pub const DUPLICATE_SAME_ACCESS: DWORD = 0x00000002;
 
 pub const CONDITION_VARIABLE_INIT: CONDITION_VARIABLE = CONDITION_VARIABLE { ptr: ptr::null_mut() };
 pub const SRWLOCK_INIT: SRWLOCK = SRWLOCK { ptr: ptr::null_mut() };
+pub const INIT_ONCE_STATIC_INIT: INIT_ONCE = INIT_ONCE { ptr: ptr::null_mut() };
+
+pub const INIT_ONCE_INIT_FAILED: DWORD = 0x00000004;
 
 pub const DETACHED_PROCESS: DWORD = 0x00000008;
 pub const CREATE_NEW_PROCESS_GROUP: DWORD = 0x00000200;
@@ -285,6 +295,8 @@ pub fn nt_success(status: NTSTATUS) -> bool {
     status >= 0
 }
 
+// "RNG\0"
+pub const BCRYPT_RNG_ALGORITHM: &[u16] = &[b'R' as u16, b'N' as u16, b'G' as u16, 0];
 pub const BCRYPT_USE_SYSTEM_PREFERRED_RNG: DWORD = 0x00000002;
 
 #[repr(C)]
@@ -351,7 +363,7 @@ impl IO_STATUS_BLOCK {
 
 pub type LPOVERLAPPED_COMPLETION_ROUTINE = unsafe extern "system" fn(
     dwErrorCode: DWORD,
-    dwNumberOfBytesTransfered: DWORD,
+    dwNumberOfBytesTransferred: DWORD,
     lpOverlapped: *mut OVERLAPPED,
 );
 
@@ -455,6 +467,12 @@ pub enum FILE_INFO_BY_HANDLE_CLASS {
 }
 
 #[repr(C)]
+pub struct FILE_ATTRIBUTE_TAG_INFO {
+    pub FileAttributes: DWORD,
+    pub ReparseTag: DWORD,
+}
+
+#[repr(C)]
 pub struct FILE_DISPOSITION_INFO {
     pub DeleteFile: BOOLEAN,
 }
@@ -501,6 +519,8 @@ pub struct FILE_END_OF_FILE_INFO {
     pub EndOfFile: LARGE_INTEGER,
 }
 
+/// NB: Use carefully! In general using this as a reference is likely to get the
+/// provenance wrong for the `rest` field!
 #[repr(C)]
 pub struct REPARSE_DATA_BUFFER {
     pub ReparseTag: c_uint,
@@ -509,6 +529,8 @@ pub struct REPARSE_DATA_BUFFER {
     pub rest: (),
 }
 
+/// NB: Use carefully! In general using this as a reference is likely to get the
+/// provenance wrong for the `PathBuffer` field!
 #[repr(C)]
 pub struct SYMBOLIC_LINK_REPARSE_BUFFER {
     pub SubstituteNameOffset: c_ushort,
@@ -517,6 +539,14 @@ pub struct SYMBOLIC_LINK_REPARSE_BUFFER {
     pub PrintNameLength: c_ushort,
     pub Flags: c_ulong,
     pub PathBuffer: WCHAR,
+}
+
+/// NB: Use carefully! In general using this as a reference is likely to get the
+/// provenance wrong for the `PathBuffer` field!
+#[repr(C)]
+pub struct FILE_NAME_INFO {
+    pub FileNameLength: DWORD,
+    pub FileName: [WCHAR; 1],
 }
 
 #[repr(C)]
@@ -548,6 +578,10 @@ pub struct CONDITION_VARIABLE {
 }
 #[repr(C)]
 pub struct SRWLOCK {
+    pub ptr: LPVOID,
+}
+#[repr(C)]
+pub struct INIT_ONCE {
     pub ptr: LPVOID,
 }
 
@@ -740,6 +774,16 @@ pub struct timeval {
     pub tv_usec: c_long,
 }
 
+#[repr(C)]
+#[derive(Copy, Clone)]
+pub struct CONSOLE_READCONSOLE_CONTROL {
+    pub nLength: ULONG,
+    pub nInitialChars: ULONG,
+    pub dwCtrlWakeupMask: ULONG,
+    pub dwControlKeyState: ULONG,
+}
+pub type PCONSOLE_READCONSOLE_CONTROL = *mut CONSOLE_READCONSOLE_CONTROL;
+
 // Desktop specific functions & types
 cfg_if::cfg_if! {
 if #[cfg(not(target_vendor = "uwp"))] {
@@ -769,17 +813,6 @@ if #[cfg(not(target_vendor = "uwp"))] {
         extern "system" fn(ExceptionInfo: *mut EXCEPTION_POINTERS) -> LONG;
 
     #[repr(C)]
-    #[derive(Copy, Clone)]
-    pub struct CONSOLE_READCONSOLE_CONTROL {
-        pub nLength: ULONG,
-        pub nInitialChars: ULONG,
-        pub dwCtrlWakeupMask: ULONG,
-        pub dwControlKeyState: ULONG,
-    }
-
-    pub type PCONSOLE_READCONSOLE_CONTROL = *mut CONSOLE_READCONSOLE_CONTROL;
-
-    #[repr(C)]
     pub struct BY_HANDLE_FILE_INFORMATION {
         pub dwFileAttributes: DWORD,
         pub ftCreationTime: FILETIME,
@@ -794,7 +827,6 @@ if #[cfg(not(target_vendor = "uwp"))] {
     }
 
     pub type LPBY_HANDLE_FILE_INFORMATION = *mut BY_HANDLE_FILE_INFORMATION;
-    pub type LPCVOID = *const c_void;
 
     pub const HANDLE_FLAG_INHERIT: DWORD = 0x00000001;
 
@@ -802,10 +834,6 @@ if #[cfg(not(target_vendor = "uwp"))] {
 
     #[link(name = "advapi32")]
     extern "system" {
-        // Forbidden when targeting UWP
-        #[link_name = "SystemFunction036"]
-        pub fn RtlGenRandom(RandomBuffer: *mut u8, RandomBufferLength: ULONG) -> BOOLEAN;
-
         // Allowed but unused by UWP
         pub fn OpenProcessToken(
             ProcessHandle: HANDLE,
@@ -826,24 +854,6 @@ if #[cfg(not(target_vendor = "uwp"))] {
 
     #[link(name = "kernel32")]
     extern "system" {
-        // Functions forbidden when targeting UWP
-        pub fn ReadConsoleW(
-            hConsoleInput: HANDLE,
-            lpBuffer: LPVOID,
-            nNumberOfCharsToRead: DWORD,
-            lpNumberOfCharsRead: LPDWORD,
-            pInputControl: PCONSOLE_READCONSOLE_CONTROL,
-        ) -> BOOL;
-
-        pub fn WriteConsoleW(
-            hConsoleOutput: HANDLE,
-            lpBuffer: LPCVOID,
-            nNumberOfCharsToWrite: DWORD,
-            lpNumberOfCharsWritten: LPDWORD,
-            lpReserved: LPVOID,
-        ) -> BOOL;
-
-        pub fn GetConsoleMode(hConsoleHandle: HANDLE, lpMode: LPDWORD) -> BOOL;
         // Allowed but unused by UWP
         pub fn GetFileInformationByHandle(
             hFile: HANDLE,
@@ -884,6 +894,22 @@ if #[cfg(target_vendor = "uwp")] {
 #[link(name = "kernel32")]
 extern "system" {
     pub fn GetCurrentProcessId() -> DWORD;
+
+    pub fn ReadConsoleW(
+        hConsoleInput: HANDLE,
+        lpBuffer: LPVOID,
+        nNumberOfCharsToRead: DWORD,
+        lpNumberOfCharsRead: LPDWORD,
+        pInputControl: PCONSOLE_READCONSOLE_CONTROL,
+    ) -> BOOL;
+    pub fn WriteConsoleW(
+        hConsoleOutput: HANDLE,
+        lpBuffer: LPCVOID,
+        nNumberOfCharsToWrite: DWORD,
+        lpNumberOfCharsWritten: LPDWORD,
+        lpReserved: LPVOID,
+    ) -> BOOL;
+    pub fn GetConsoleMode(hConsoleHandle: HANDLE, lpMode: LPDWORD) -> BOOL;
 
     pub fn GetSystemDirectoryW(lpBuffer: LPWSTR, uSize: UINT) -> UINT;
     pub fn RemoveDirectoryW(lpPathName: LPCWSTR) -> BOOL;
@@ -944,6 +970,7 @@ extern "system" {
     pub fn TlsAlloc() -> DWORD;
     pub fn TlsGetValue(dwTlsIndex: DWORD) -> LPVOID;
     pub fn TlsSetValue(dwTlsIndex: DWORD, lpTlsvalue: LPVOID) -> BOOL;
+    pub fn TlsFree(dwTlsIndex: DWORD) -> BOOL;
     pub fn GetLastError() -> DWORD;
     pub fn QueryPerformanceFrequency(lpFrequency: *mut LARGE_INTEGER) -> BOOL;
     pub fn QueryPerformanceCounter(lpPerformanceCount: *mut LARGE_INTEGER) -> BOOL;
@@ -1086,6 +1113,7 @@ extern "system" {
         lpFileInformation: LPVOID,
         dwBufferSize: DWORD,
     ) -> BOOL;
+    pub fn GetFileType(hfile: HANDLE) -> DWORD;
     pub fn SleepConditionVariableSRW(
         ConditionVariable: PCONDITION_VARIABLE,
         SRWLock: PSRWLOCK,
@@ -1102,6 +1130,14 @@ extern "system" {
     pub fn ReleaseSRWLockShared(SRWLock: PSRWLOCK);
     pub fn TryAcquireSRWLockExclusive(SRWLock: PSRWLOCK) -> BOOLEAN;
     pub fn TryAcquireSRWLockShared(SRWLock: PSRWLOCK) -> BOOLEAN;
+
+    pub fn InitOnceBeginInitialize(
+        lpInitOnce: LPINIT_ONCE,
+        dwFlags: DWORD,
+        fPending: LPBOOL,
+        lpContext: *mut LPVOID,
+    ) -> BOOL;
+    pub fn InitOnceComplete(lpInitOnce: LPINIT_ONCE, dwFlags: DWORD, lpContext: LPVOID) -> BOOL;
 
     pub fn CompareStringOrdinal(
         lpString1: LPCWSTR,
@@ -1217,11 +1253,18 @@ extern "system" {
     // >= Vista / Server 2008
     // https://docs.microsoft.com/en-us/windows/win32/api/bcrypt/nf-bcrypt-bcryptgenrandom
     pub fn BCryptGenRandom(
-        hAlgorithm: LPVOID,
+        hAlgorithm: BCRYPT_ALG_HANDLE,
         pBuffer: *mut u8,
         cbBuffer: ULONG,
         dwFlags: ULONG,
     ) -> NTSTATUS;
+    pub fn BCryptOpenAlgorithmProvider(
+        phalgorithm: *mut BCRYPT_ALG_HANDLE,
+        pszAlgId: LPCWSTR,
+        pszimplementation: LPCWSTR,
+        dwflags: ULONG,
+    ) -> NTSTATUS;
+    pub fn BCryptCloseAlgorithmProvider(hAlgorithm: BCRYPT_ALG_HANDLE, dwFlags: ULONG) -> NTSTATUS;
 }
 
 // Functions that aren't available on every version of Windows that we support,
@@ -1250,21 +1293,16 @@ compat_fn_with_fallback! {
     }
 }
 
-compat_fn_with_fallback! {
-    pub static SYNCH_API: &CStr = ansi_str!("api-ms-win-core-synch-l1-2-0");
-    #[allow(unused)]
-    fn WakeByAddressSingle(Address: LPVOID) -> () {
-        // This fallback is currently tightly coupled to its use in Parker::unpark.
-        //
-        // FIXME: If `WakeByAddressSingle` needs to be used anywhere other than
-        // Parker::unpark then this fallback will be wrong and will need to be decoupled.
-        crate::sys::windows::thread_parker::unpark_keyed_event(Address)
-    }
+compat_fn_optional! {
+    crate::sys::compat::load_synch_functions();
+    pub fn WaitOnAddress(
+        Address: LPVOID,
+        CompareAddress: LPVOID,
+        AddressSize: SIZE_T,
+        dwMilliseconds: DWORD
+    );
+    pub fn WakeByAddressSingle(Address: LPVOID);
 }
-pub use crate::sys::compat::WaitOnAddress;
-// Change exported name of `WakeByAddressSingle` to make the strange fallback
-// behaviour clear.
-pub use WakeByAddressSingle::call as wake_by_address_single_or_unpark_keyed_event;
 
 compat_fn_with_fallback! {
     pub static NTDLL: &CStr = ansi_str!("ntdll");

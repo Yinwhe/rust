@@ -37,13 +37,16 @@ use rustc_middle::traits::ObligationCause;
 use rustc_middle::ty::error::{ExpectedFound, TypeError};
 use rustc_middle::ty::relate::{self, Relate, RelateResult, TypeRelation};
 use rustc_middle::ty::subst::SubstsRef;
-use rustc_middle::ty::{self, InferConst, ToPredicate, Ty, TyCtxt, TypeVisitable};
+use rustc_middle::ty::{
+    self, FallibleTypeFolder, InferConst, Ty, TyCtxt, TypeFoldable, TypeSuperFoldable,
+    TypeVisitable,
+};
 use rustc_middle::ty::{IntType, UintType};
 use rustc_span::{Span, DUMMY_SP};
 
 #[derive(Clone)]
 pub struct CombineFields<'infcx, 'tcx> {
-    pub infcx: &'infcx InferCtxt<'infcx, 'tcx>,
+    pub infcx: &'infcx InferCtxt<'tcx>,
     pub trace: TypeTrace<'tcx>,
     pub cause: Option<ty::relate::Cause>,
     pub param_env: ty::ParamEnv<'tcx>,
@@ -63,7 +66,7 @@ pub enum RelationDir {
     EqTo,
 }
 
-impl<'infcx, 'tcx> InferCtxt<'infcx, 'tcx> {
+impl<'tcx> InferCtxt<'tcx> {
     pub fn super_combine_tys<R>(
         &self,
         relation: &mut R,
@@ -140,18 +143,12 @@ impl<'infcx, 'tcx> InferCtxt<'infcx, 'tcx> {
         let a = self.shallow_resolve(a);
         let b = self.shallow_resolve(b);
 
-        let a_is_expected = relation.a_is_expected();
-
         match (a.kind(), b.kind()) {
             (
                 ty::ConstKind::Infer(InferConst::Var(a_vid)),
                 ty::ConstKind::Infer(InferConst::Var(b_vid)),
             ) => {
-                self.inner
-                    .borrow_mut()
-                    .const_unification_table()
-                    .unify_var_var(a_vid, b_vid)
-                    .map_err(|e| const_unification_error(a_is_expected, e))?;
+                self.inner.borrow_mut().const_unification_table().union(a_vid, b_vid);
                 return Ok(a);
             }
 
@@ -162,11 +159,11 @@ impl<'infcx, 'tcx> InferCtxt<'infcx, 'tcx> {
             }
 
             (ty::ConstKind::Infer(InferConst::Var(vid)), _) => {
-                return self.unify_const_variable(relation.param_env(), vid, b, a_is_expected);
+                return self.unify_const_variable(vid, b);
             }
 
             (_, ty::ConstKind::Infer(InferConst::Var(vid))) => {
-                return self.unify_const_variable(relation.param_env(), vid, a, !a_is_expected);
+                return self.unify_const_variable(vid, a);
             }
             (ty::ConstKind::Unevaluated(..), _) if self.tcx.lazy_normalization() => {
                 // FIXME(#59490): Need to remove the leak check to accommodate
@@ -223,14 +220,12 @@ impl<'infcx, 'tcx> InferCtxt<'infcx, 'tcx> {
     ///
     /// As `3 + 4` contains `N` in its substs, this must not succeed.
     ///
-    /// See `src/test/ui/const-generics/occurs-check/` for more examples where this is relevant.
+    /// See `tests/ui/const-generics/occurs-check/` for more examples where this is relevant.
     #[instrument(level = "debug", skip(self))]
     fn unify_const_variable(
         &self,
-        param_env: ty::ParamEnv<'tcx>,
         target_vid: ty::ConstVid<'tcx>,
         ct: ty::Const<'tcx>,
-        vid_is_expected: bool,
     ) -> RelateResult<'tcx, ty::Const<'tcx>> {
         let (for_universe, span) = {
             let mut inner = self.inner.borrow_mut();
@@ -243,24 +238,24 @@ impl<'infcx, 'tcx> InferCtxt<'infcx, 'tcx> {
                 ConstVariableValue::Unknown { universe } => (universe, var_value.origin.span),
             }
         };
-        let value = ConstInferUnifier { infcx: self, span, param_env, for_universe, target_vid }
-            .relate(ct, ct)?;
+        let value = ct.try_fold_with(&mut ConstInferUnifier {
+            infcx: self,
+            span,
+            for_universe,
+            target_vid,
+        })?;
 
-        self.inner
-            .borrow_mut()
-            .const_unification_table()
-            .unify_var_value(
-                target_vid,
-                ConstVarValue {
-                    origin: ConstVariableOrigin {
-                        kind: ConstVariableOriginKind::ConstInference,
-                        span: DUMMY_SP,
-                    },
-                    val: ConstVariableValue::Known { value },
+        self.inner.borrow_mut().const_unification_table().union_value(
+            target_vid,
+            ConstVarValue {
+                origin: ConstVariableOrigin {
+                    kind: ConstVariableOriginKind::ConstInference,
+                    span: DUMMY_SP,
                 },
-            )
-            .map(|()| value)
-            .map_err(|e| const_unification_error(vid_is_expected, e))
+                val: ConstVariableValue::Known { value },
+            },
+        );
+        Ok(value)
     }
 
     fn unify_integral_variable(
@@ -339,7 +334,7 @@ impl<'infcx, 'tcx> CombineFields<'infcx, 'tcx> {
         debug_assert!(self.infcx.inner.borrow_mut().type_variables().probe(b_vid).is_unknown());
 
         // Generalize type of `a_ty` appropriately depending on the
-        // direction.  As an example, assume:
+        // direction. As an example, assume:
         //
         // - `a_ty == &'x ?1`, where `'x` is some free region and `?1` is an
         //   inference variable,
@@ -355,10 +350,10 @@ impl<'infcx, 'tcx> CombineFields<'infcx, 'tcx> {
 
         if needs_wf {
             self.obligations.push(Obligation::new(
+                self.tcx(),
                 self.trace.cause.clone(),
                 self.param_env,
-                ty::Binder::dummy(ty::PredicateKind::WellFormed(b_ty.into()))
-                    .to_predicate(self.infcx.tcx),
+                ty::Binder::dummy(ty::PredicateKind::WellFormed(b_ty.into())),
             ));
         }
 
@@ -391,7 +386,7 @@ impl<'infcx, 'tcx> CombineFields<'infcx, 'tcx> {
     /// Preconditions:
     ///
     /// - `for_vid` is a "root vid"
-    #[instrument(skip(self), level = "trace")]
+    #[instrument(skip(self), level = "trace", ret)]
     fn generalize(
         &self,
         ty: Ty<'tcx>,
@@ -435,15 +430,8 @@ impl<'infcx, 'tcx> CombineFields<'infcx, 'tcx> {
             cache: SsoHashMap::new(),
         };
 
-        let ty = match generalize.relate(ty, ty) {
-            Ok(ty) => ty,
-            Err(e) => {
-                debug!(?e, "failure");
-                return Err(e);
-            }
-        };
+        let ty = generalize.relate(ty, ty)?;
         let needs_wf = generalize.needs_wf;
-        trace!(?ty, ?needs_wf, "success");
         Ok(Generalization { ty, needs_wf })
     }
 
@@ -459,15 +447,25 @@ impl<'infcx, 'tcx> CombineFields<'infcx, 'tcx> {
             ty::PredicateKind::ConstEquate(b, a)
         };
         self.obligations.push(Obligation::new(
+            self.tcx(),
             self.trace.cause.clone(),
             self.param_env,
-            ty::Binder::dummy(predicate).to_predicate(self.tcx()),
+            ty::Binder::dummy(predicate),
+        ));
+    }
+
+    pub fn mark_ambiguous(&mut self) {
+        self.obligations.push(Obligation::new(
+            self.tcx(),
+            self.trace.cause.clone(),
+            self.param_env,
+            ty::Binder::dummy(ty::PredicateKind::Ambiguous),
         ));
     }
 }
 
 struct Generalizer<'cx, 'tcx> {
-    infcx: &'cx InferCtxt<'cx, 'tcx>,
+    infcx: &'cx InferCtxt<'tcx>,
 
     /// The span, used when creating new type variables and things.
     cause: &'cx ObligationCause<'tcx>,
@@ -493,12 +491,13 @@ struct Generalizer<'cx, 'tcx> {
 
     param_env: ty::ParamEnv<'tcx>,
 
-    cache: SsoHashMap<Ty<'tcx>, RelateResult<'tcx, Ty<'tcx>>>,
+    cache: SsoHashMap<Ty<'tcx>, Ty<'tcx>>,
 }
 
 /// Result from a generalization operation. This includes
 /// not only the generalized type, but also a bool flag
 /// indicating whether further WF checks are needed.
+#[derive(Debug)]
 struct Generalization<'tcx> {
     ty: Ty<'tcx>,
 
@@ -534,6 +533,11 @@ impl<'tcx> TypeRelation<'tcx> for Generalizer<'_, 'tcx> {
     fn tcx(&self) -> TyCtxt<'tcx> {
         self.infcx.tcx
     }
+
+    fn intercrate(&self) -> bool {
+        self.infcx.intercrate
+    }
+
     fn param_env(&self) -> ty::ParamEnv<'tcx> {
         self.param_env
     }
@@ -544,6 +548,10 @@ impl<'tcx> TypeRelation<'tcx> for Generalizer<'_, 'tcx> {
 
     fn a_is_expected(&self) -> bool {
         true
+    }
+
+    fn mark_ambiguous(&mut self) {
+        span_bug!(self.cause.span, "opaque types are handled in `tys`");
     }
 
     fn binders<T>(
@@ -577,6 +585,7 @@ impl<'tcx> TypeRelation<'tcx> for Generalizer<'_, 'tcx> {
                 &opt_variances,
                 a_subst,
                 b_subst,
+                true,
             )
         }
     }
@@ -599,8 +608,8 @@ impl<'tcx> TypeRelation<'tcx> for Generalizer<'_, 'tcx> {
     fn tys(&mut self, t: Ty<'tcx>, t2: Ty<'tcx>) -> RelateResult<'tcx, Ty<'tcx>> {
         assert_eq!(t, t2); // we are abusing TypeRelation here; both LHS and RHS ought to be ==
 
-        if let Some(result) = self.cache.get(&t) {
-            return result.clone();
+        if let Some(&result) = self.cache.get(&t) {
+            return Ok(result);
         }
         debug!("generalize: t={:?}", t);
 
@@ -669,11 +678,15 @@ impl<'tcx> TypeRelation<'tcx> for Generalizer<'_, 'tcx> {
                 // relatable.
                 Ok(t)
             }
+            ty::Alias(ty::Opaque, ty::AliasTy { def_id, substs, .. }) => {
+                let s = self.relate(substs, substs)?;
+                Ok(if s == substs { t } else { self.infcx.tcx.mk_opaque(def_id, s) })
+            }
             _ => relate::super_relate_tys(self, t, t),
-        };
+        }?;
 
-        self.cache.insert(t, result.clone());
-        return result;
+        self.cache.insert(t, result);
+        Ok(result)
     }
 
     fn regions(
@@ -694,7 +707,6 @@ impl<'tcx> TypeRelation<'tcx> for Generalizer<'_, 'tcx> {
 
             ty::RePlaceholder(..)
             | ty::ReVar(..)
-            | ty::ReEmpty(_)
             | ty::ReStatic
             | ty::ReEarlyBound(..)
             | ty::ReFree(..) => {
@@ -744,25 +756,19 @@ impl<'tcx> TypeRelation<'tcx> for Generalizer<'_, 'tcx> {
                                 origin: var_value.origin,
                                 val: ConstVariableValue::Unknown { universe: self.for_universe },
                             });
-                            Ok(self.tcx().mk_const_var(new_var_id, c.ty()))
+                            Ok(self.tcx().mk_const(new_var_id, c.ty()))
                         }
                     }
                 }
             }
-            ty::ConstKind::Unevaluated(ty::Unevaluated { def, substs, promoted })
-                if self.tcx().lazy_normalization() =>
-            {
-                assert_eq!(promoted, None);
+            ty::ConstKind::Unevaluated(ty::UnevaluatedConst { def, substs }) => {
                 let substs = self.relate_with_variance(
                     ty::Variance::Invariant,
                     ty::VarianceDiagInfo::default(),
                     substs,
                     substs,
                 )?;
-                Ok(self.tcx().mk_const(ty::ConstS {
-                    ty: c.ty(),
-                    kind: ty::ConstKind::Unevaluated(ty::Unevaluated { def, substs, promoted }),
-                }))
+                Ok(self.tcx().mk_const(ty::UnevaluatedConst { def, substs }, c.ty()))
             }
             _ => relate::super_relate_consts(self, c, c),
         }
@@ -774,13 +780,6 @@ pub trait ConstEquateRelation<'tcx>: TypeRelation<'tcx> {
     ///
     /// If they aren't equal then the relation doesn't hold.
     fn const_equate_obligation(&mut self, a: ty::Const<'tcx>, b: ty::Const<'tcx>);
-}
-
-pub fn const_unification_error<'tcx>(
-    a_is_expected: bool,
-    (a, b): (ty::Const<'tcx>, ty::Const<'tcx>),
-) -> TypeError<'tcx> {
-    TypeError::ConstMismatch(ExpectedFound::new(a_is_expected, a, b))
 }
 
 fn int_unification_error<'tcx>(
@@ -800,11 +799,9 @@ fn float_unification_error<'tcx>(
 }
 
 struct ConstInferUnifier<'cx, 'tcx> {
-    infcx: &'cx InferCtxt<'cx, 'tcx>,
+    infcx: &'cx InferCtxt<'tcx>,
 
     span: Span,
-
-    param_env: ty::ParamEnv<'tcx>,
 
     for_universe: ty::UniverseIndex,
 
@@ -814,53 +811,15 @@ struct ConstInferUnifier<'cx, 'tcx> {
     target_vid: ty::ConstVid<'tcx>,
 }
 
-// We use `TypeRelation` here to propagate `RelateResult` upwards.
-//
-// Both inputs are expected to be the same.
-impl<'tcx> TypeRelation<'tcx> for ConstInferUnifier<'_, 'tcx> {
-    fn tcx(&self) -> TyCtxt<'tcx> {
+impl<'tcx> FallibleTypeFolder<'tcx> for ConstInferUnifier<'_, 'tcx> {
+    type Error = TypeError<'tcx>;
+
+    fn tcx<'a>(&'a self) -> TyCtxt<'tcx> {
         self.infcx.tcx
     }
 
-    fn param_env(&self) -> ty::ParamEnv<'tcx> {
-        self.param_env
-    }
-
-    fn tag(&self) -> &'static str {
-        "ConstInferUnifier"
-    }
-
-    fn a_is_expected(&self) -> bool {
-        true
-    }
-
-    fn relate_with_variance<T: Relate<'tcx>>(
-        &mut self,
-        _variance: ty::Variance,
-        _info: ty::VarianceDiagInfo<'tcx>,
-        a: T,
-        b: T,
-    ) -> RelateResult<'tcx, T> {
-        // We don't care about variance here.
-        self.relate(a, b)
-    }
-
-    fn binders<T>(
-        &mut self,
-        a: ty::Binder<'tcx, T>,
-        b: ty::Binder<'tcx, T>,
-    ) -> RelateResult<'tcx, ty::Binder<'tcx, T>>
-    where
-        T: Relate<'tcx>,
-    {
-        Ok(a.rebind(self.relate(a.skip_binder(), b.skip_binder())?))
-    }
-
-    #[tracing::instrument(level = "debug", skip(self))]
-    fn tys(&mut self, t: Ty<'tcx>, _t: Ty<'tcx>) -> RelateResult<'tcx, Ty<'tcx>> {
-        debug_assert_eq!(t, _t);
-        debug!("ConstInferUnifier: t={:?}", t);
-
+    #[instrument(level = "debug", skip(self), ret)]
+    fn try_fold_ty(&mut self, t: Ty<'tcx>) -> Result<Ty<'tcx>, TypeError<'tcx>> {
         match t.kind() {
             &ty::Infer(ty::TyVar(vid)) => {
                 let vid = self.infcx.inner.borrow_mut().type_variables().root_var(vid);
@@ -868,7 +827,7 @@ impl<'tcx> TypeRelation<'tcx> for ConstInferUnifier<'_, 'tcx> {
                 match probe {
                     TypeVariableValue::Known { value: u } => {
                         debug!("ConstOccursChecker: known value {:?}", u);
-                        self.tys(u, u)
+                        u.try_fold_with(self)
                     }
                     TypeVariableValue::Unknown { universe } => {
                         if self.for_universe.can_name(universe) {
@@ -883,26 +842,20 @@ impl<'tcx> TypeRelation<'tcx> for ConstInferUnifier<'_, 'tcx> {
                             .borrow_mut()
                             .type_variables()
                             .new_var(self.for_universe, origin);
-                        let u = self.tcx().mk_ty_var(new_var_id);
-                        debug!(
-                            "ConstInferUnifier: replacing original vid={:?} with new={:?}",
-                            vid, u
-                        );
-                        Ok(u)
+                        Ok(self.tcx().mk_ty_var(new_var_id))
                     }
                 }
             }
             ty::Infer(ty::IntVar(_) | ty::FloatVar(_)) => Ok(t),
-            _ => relate::super_relate_tys(self, t, t),
+            _ => t.try_super_fold_with(self),
         }
     }
 
-    fn regions(
+    #[instrument(level = "debug", skip(self), ret)]
+    fn try_fold_region(
         &mut self,
         r: ty::Region<'tcx>,
-        _r: ty::Region<'tcx>,
-    ) -> RelateResult<'tcx, ty::Region<'tcx>> {
-        debug_assert_eq!(r, _r);
+    ) -> Result<ty::Region<'tcx>, TypeError<'tcx>> {
         debug!("ConstInferUnifier: r={:?}", r);
 
         match *r {
@@ -914,7 +867,6 @@ impl<'tcx> TypeRelation<'tcx> for ConstInferUnifier<'_, 'tcx> {
 
             ty::RePlaceholder(..)
             | ty::ReVar(..)
-            | ty::ReEmpty(_)
             | ty::ReStatic
             | ty::ReEarlyBound(..)
             | ty::ReFree(..) => {
@@ -932,15 +884,8 @@ impl<'tcx> TypeRelation<'tcx> for ConstInferUnifier<'_, 'tcx> {
         }
     }
 
-    #[tracing::instrument(level = "debug", skip(self))]
-    fn consts(
-        &mut self,
-        c: ty::Const<'tcx>,
-        _c: ty::Const<'tcx>,
-    ) -> RelateResult<'tcx, ty::Const<'tcx>> {
-        debug_assert_eq!(c, _c);
-        debug!("ConstInferUnifier: c={:?}", c);
-
+    #[instrument(level = "debug", skip(self), ret)]
+    fn try_fold_const(&mut self, c: ty::Const<'tcx>) -> Result<ty::Const<'tcx>, TypeError<'tcx>> {
         match c.kind() {
             ty::ConstKind::Infer(InferConst::Var(vid)) => {
                 // Check if the current unification would end up
@@ -961,7 +906,7 @@ impl<'tcx> TypeRelation<'tcx> for ConstInferUnifier<'_, 'tcx> {
                 let var_value =
                     self.infcx.inner.borrow_mut().const_unification_table().probe_value(vid);
                 match var_value.val {
-                    ConstVariableValue::Known { value: u } => self.consts(u, u),
+                    ConstVariableValue::Known { value: u } => u.try_fold_with(self),
                     ConstVariableValue::Unknown { universe } => {
                         if self.for_universe.can_name(universe) {
                             Ok(c)
@@ -975,27 +920,12 @@ impl<'tcx> TypeRelation<'tcx> for ConstInferUnifier<'_, 'tcx> {
                                         },
                                     },
                                 );
-                            Ok(self.tcx().mk_const_var(new_var_id, c.ty()))
+                            Ok(self.tcx().mk_const(new_var_id, c.ty()))
                         }
                     }
                 }
             }
-            ty::ConstKind::Unevaluated(ty::Unevaluated { def, substs, promoted })
-                if self.tcx().lazy_normalization() =>
-            {
-                assert_eq!(promoted, None);
-                let substs = self.relate_with_variance(
-                    ty::Variance::Invariant,
-                    ty::VarianceDiagInfo::default(),
-                    substs,
-                    substs,
-                )?;
-                Ok(self.tcx().mk_const(ty::ConstS {
-                    ty: c.ty(),
-                    kind: ty::ConstKind::Unevaluated(ty::Unevaluated { def, substs, promoted }),
-                }))
-            }
-            _ => relate::super_relate_consts(self, c, c),
+            _ => c.try_super_fold_with(self),
         }
     }
 }

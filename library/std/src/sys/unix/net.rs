@@ -393,6 +393,17 @@ impl Socket {
     }
 
     #[cfg(any(target_os = "android", target_os = "linux",))]
+    pub fn set_quickack(&self, quickack: bool) -> io::Result<()> {
+        setsockopt(self, libc::IPPROTO_TCP, libc::TCP_QUICKACK, quickack as c_int)
+    }
+
+    #[cfg(any(target_os = "android", target_os = "linux",))]
+    pub fn quickack(&self) -> io::Result<bool> {
+        let raw: c_int = getsockopt(self, libc::IPPROTO_TCP, libc::TCP_QUICKACK)?;
+        Ok(raw != 0)
+    }
+
+    #[cfg(any(target_os = "android", target_os = "linux",))]
     pub fn set_passcred(&self, passcred: bool) -> io::Result<()> {
         setsockopt(self, libc::SOL_SOCKET, libc::SO_PASSCRED, passcred as libc::c_int)
     }
@@ -425,6 +436,17 @@ impl Socket {
         // FIONBIO is inadequate for sockets on illumos/Solaris, so use the
         // fcntl(F_[GS]ETFL)-based method provided by FileDesc instead.
         self.0.set_nonblocking(nonblocking)
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "freebsd", target_os = "openbsd"))]
+    pub fn set_mark(&self, mark: u32) -> io::Result<()> {
+        #[cfg(target_os = "linux")]
+        let option = libc::SO_MARK;
+        #[cfg(target_os = "freebsd")]
+        let option = libc::SO_USER_COOKIE;
+        #[cfg(target_os = "openbsd")]
+        let option = libc::SO_RTABLE;
+        setsockopt(self, libc::SOL_SOCKET, option, mark as libc::c_int)
     }
 
     pub fn take_error(&self) -> io::Result<Option<io::Error>> {
@@ -490,7 +512,7 @@ impl FromRawFd for Socket {
 // A workaround for this bug is to call the res_init libc function, to clear
 // the cached configs. Unfortunately, while we believe glibc's implementation
 // of res_init is thread-safe, we know that other implementations are not
-// (https://github.com/rust-lang/rust/issues/43592). Code here in libstd could
+// (https://github.com/rust-lang/rust/issues/43592). Code here in std could
 // try to synchronize its res_init calls with a Mutex, but that wouldn't
 // protect programs that call into libc in other ways. So instead of calling
 // res_init unconditionally, we call it only when we detect we're linking

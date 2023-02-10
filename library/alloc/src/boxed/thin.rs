@@ -2,6 +2,7 @@
 // https://github.com/matthieu-m/rfc2580/blob/b58d1d3cba0d4b5e859d3617ea2d0943aaa31329/examples/thin.rs
 // by matthieu-m
 use crate::alloc::{self, Layout, LayoutError};
+use core::error::Error;
 use core::fmt::{self, Debug, Display, Formatter};
 use core::marker::PhantomData;
 #[cfg(not(no_global_oom_handling))]
@@ -47,7 +48,7 @@ unsafe impl<T: ?Sized + Sync> Sync for ThinBox<T> {}
 
 #[unstable(feature = "thin_box", issue = "92791")]
 impl<T> ThinBox<T> {
-    /// Moves a type to the heap with its `Metadata` stored in the heap allocation instead of on
+    /// Moves a type to the heap with its [`Metadata`] stored in the heap allocation instead of on
     /// the stack.
     ///
     /// # Examples
@@ -58,6 +59,8 @@ impl<T> ThinBox<T> {
     ///
     /// let five = ThinBox::new(5);
     /// ```
+    ///
+    /// [`Metadata`]: core::ptr::Pointee::Metadata
     #[cfg(not(no_global_oom_handling))]
     pub fn new(value: T) -> Self {
         let meta = ptr::metadata(&value);
@@ -68,7 +71,7 @@ impl<T> ThinBox<T> {
 
 #[unstable(feature = "thin_box", issue = "92791")]
 impl<Dyn: ?Sized> ThinBox<Dyn> {
-    /// Moves a type to the heap with its `Metadata` stored in the heap allocation instead of on
+    /// Moves a type to the heap with its [`Metadata`] stored in the heap allocation instead of on
     /// the stack.
     ///
     /// # Examples
@@ -79,6 +82,8 @@ impl<Dyn: ?Sized> ThinBox<Dyn> {
     ///
     /// let thin_slice = ThinBox::<[i32]>::new_unsize([1, 2, 3, 4]);
     /// ```
+    ///
+    /// [`Metadata`]: core::ptr::Pointee::Metadata
     #[cfg(not(no_global_oom_handling))]
     pub fn new_unsize<T>(value: T) -> Self
     where
@@ -225,24 +230,45 @@ impl<H> WithHeader<H> {
     // - Assumes that either `value` can be dereferenced, or is the
     //   `NonNull::dangling()` we use when both `T` and `H` are ZSTs.
     unsafe fn drop<T: ?Sized>(&self, value: *mut T) {
+        struct DropGuard<H> {
+            ptr: NonNull<u8>,
+            value_layout: Layout,
+            _marker: PhantomData<H>,
+        }
+
+        impl<H> Drop for DropGuard<H> {
+            fn drop(&mut self) {
+                unsafe {
+                    // SAFETY: Layout must have been computable if we're in drop
+                    let (layout, value_offset) =
+                        WithHeader::<H>::alloc_layout(self.value_layout).unwrap_unchecked();
+
+                    // Note: Don't deallocate if the layout size is zero, because the pointer
+                    // didn't come from the allocator.
+                    if layout.size() != 0 {
+                        alloc::dealloc(self.ptr.as_ptr().sub(value_offset), layout);
+                    } else {
+                        debug_assert!(
+                            value_offset == 0
+                                && mem::size_of::<H>() == 0
+                                && self.value_layout.size() == 0
+                        );
+                    }
+                }
+            }
+        }
+
         unsafe {
-            let value_layout = Layout::for_value_raw(value);
-            // SAFETY: Layout must have been computable if we're in drop
-            let (layout, value_offset) = Self::alloc_layout(value_layout).unwrap_unchecked();
+            // `_guard` will deallocate the memory when dropped, even if `drop_in_place` unwinds.
+            let _guard = DropGuard {
+                ptr: self.0,
+                value_layout: Layout::for_value_raw(value),
+                _marker: PhantomData::<H>,
+            };
 
             // We only drop the value because the Pointee trait requires that the metadata is copy
             // aka trivially droppable.
             ptr::drop_in_place::<T>(value);
-
-            // Note: Don't deallocate if the layout size is zero, because the pointer
-            // didn't come from the allocator.
-            if layout.size() != 0 {
-                alloc::dealloc(self.0.as_ptr().sub(value_offset), layout);
-            } else {
-                debug_assert!(
-                    value_offset == 0 && mem::size_of::<H>() == 0 && value_layout.size() == 0
-                );
-            }
         }
     }
 
@@ -269,5 +295,12 @@ impl<H> WithHeader<H> {
 
     fn alloc_layout(value_layout: Layout) -> Result<(Layout, usize), LayoutError> {
         Layout::new::<H>().extend(value_layout)
+    }
+}
+
+#[unstable(feature = "thin_box", issue = "92791")]
+impl<T: ?Sized + Error> Error for ThinBox<T> {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        self.deref().source()
     }
 }

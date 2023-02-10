@@ -15,7 +15,6 @@ use rustc_span::symbol::{kw, sym, Symbol};
 
 use std::fmt::{self, Write};
 use std::hash::Hash;
-use tracing::debug;
 
 /// The `DefPathTable` maps `DefIndex`es to `DefKey`s and vice versa.
 /// Internally the `DefPathTable` holds a tree of `DefKey`s, where each `DefKey`
@@ -54,9 +53,8 @@ impl DefPathTable {
             //
             // See the documentation for DefPathHash for more information.
             panic!(
-                "found DefPathHash collision between {:?} and {:?}. \
-                    Compilation cannot continue.",
-                def_path1, def_path2
+                "found DefPathHash collision between {def_path1:?} and {def_path2:?}. \
+                    Compilation cannot continue."
             );
         }
 
@@ -225,7 +223,7 @@ impl DefPath {
         let mut s = String::with_capacity(self.data.len() * 16);
 
         for component in &self.data {
-            write!(s, "::{}", component).unwrap();
+            write!(s, "::{component}").unwrap();
         }
 
         s
@@ -241,7 +239,7 @@ impl DefPath {
         for component in &self.data {
             s.extend(opt_delimiter);
             opt_delimiter = Some('-');
-            write!(s, "{}", component).unwrap();
+            write!(s, "{component}").unwrap();
         }
 
         s
@@ -369,10 +367,6 @@ impl Definitions {
         LocalDefId { local_def_index: self.table.allocate(key, def_path_hash) }
     }
 
-    pub fn iter_local_def_id(&self) -> impl Iterator<Item = LocalDefId> + '_ {
-        self.table.def_path_hashes.indices().map(|local_def_index| LocalDefId { local_def_index })
-    }
-
     #[inline(always)]
     pub fn local_def_path_hash_to_def_id(
         &self,
@@ -389,6 +383,10 @@ impl Definitions {
 
     pub fn def_path_hash_to_def_index_map(&self) -> &DefPathHashMap {
         &self.table.def_path_hash_to_index
+    }
+
+    pub fn num_definitions(&self) -> usize {
+        self.table.def_path_hashes.len()
     }
 }
 
@@ -434,7 +432,7 @@ impl fmt::Display for DefPathData {
         match self.name() {
             DefPathDataName::Named(name) => f.write_str(name.as_str()),
             // FIXME(#70334): this will generate legacy {{closure}}, {{impl}}, etc
-            DefPathDataName::Anon { namespace } => write!(f, "{{{{{}}}}}", namespace),
+            DefPathDataName::Anon { namespace } => write!(f, "{{{{{namespace}}}}}"),
         }
     }
 }

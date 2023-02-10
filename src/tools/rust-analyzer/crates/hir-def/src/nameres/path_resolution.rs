@@ -73,7 +73,10 @@ impl DefMap {
     pub(crate) fn resolve_visibility(
         &self,
         db: &dyn DefDatabase,
+        // module to import to
         original_module: LocalModuleId,
+        // pub(path)
+        //     ^^^^ this
         visibility: &RawVisibility,
     ) -> Option<Visibility> {
         let mut vis = match visibility {
@@ -115,6 +118,7 @@ impl DefMap {
         &self,
         db: &dyn DefDatabase,
         mode: ResolveMode,
+        // module to import to
         mut original_module: LocalModuleId,
         path: &ModPath,
         shadow: BuiltinShadowMode,
@@ -166,8 +170,8 @@ impl DefMap {
     ) -> ResolvePathResult {
         let graph = db.crate_graph();
         let _cx = stdx::panic_context::enter(format!(
-            "DefMap {:?} crate_name={:?} block={:?} path={}",
-            self.krate, graph[self.krate].display_name, self.block, path
+            "DefMap {:?} crate_name={:?} block={:?} path={path}",
+            self.krate, graph[self.krate].display_name, self.block
         ));
 
         let mut segments = path.segments().iter().enumerate();
@@ -361,6 +365,9 @@ impl DefMap {
                     );
                 }
             };
+
+            curr_per_ns = curr_per_ns
+                .filter_visibility(|vis| vis.is_visible_from_def_map(db, self, original_module));
         }
 
         ResolvePathResult::with(curr_per_ns, ReachedFixedPoint::Yes, None, Some(self.krate))
@@ -383,7 +390,7 @@ impl DefMap {
             .get_legacy_macro(name)
             // FIXME: shadowing
             .and_then(|it| it.last())
-            .map_or_else(PerNs::none, |&m| PerNs::macros(m.into(), Visibility::Public));
+            .map_or_else(PerNs::none, |&m| PerNs::macros(m, Visibility::Public));
         let from_scope = self[module].scope.get(name);
         let from_builtin = match self.block {
             Some(_) => {
@@ -399,14 +406,15 @@ impl DefMap {
                 Some(_) | None => from_scope.or(from_builtin),
             },
         };
-        let from_extern_prelude = self
-            .extern_prelude
-            .get(name)
-            .map_or(PerNs::none(), |&it| PerNs::types(it.into(), Visibility::Public));
 
-        let from_prelude = self.resolve_in_prelude(db, name);
+        let extern_prelude = || {
+            self.extern_prelude
+                .get(name)
+                .map_or(PerNs::none(), |&it| PerNs::types(it.into(), Visibility::Public))
+        };
+        let prelude = || self.resolve_in_prelude(db, name);
 
-        from_legacy_macro.or(from_scope_or_builtin).or(from_extern_prelude).or(from_prelude)
+        from_legacy_macro.or(from_scope_or_builtin).or_else(extern_prelude).or_else(prelude)
     }
 
     fn resolve_name_in_crate_root_or_extern_prelude(
@@ -414,20 +422,19 @@ impl DefMap {
         db: &dyn DefDatabase,
         name: &Name,
     ) -> PerNs {
-        let arc;
-        let crate_def_map = match self.block {
+        let from_crate_root = match self.block {
             Some(_) => {
-                arc = self.crate_root(db).def_map(db);
-                &arc
+                let def_map = self.crate_root(db).def_map(db);
+                def_map[def_map.root].scope.get(name)
             }
-            None => self,
+            None => self[self.root].scope.get(name),
         };
-        let from_crate_root = crate_def_map[crate_def_map.root].scope.get(name);
-        let from_extern_prelude = self
-            .resolve_name_in_extern_prelude(db, name)
-            .map_or(PerNs::none(), |it| PerNs::types(it.into(), Visibility::Public));
+        let from_extern_prelude = || {
+            self.resolve_name_in_extern_prelude(db, name)
+                .map_or(PerNs::none(), |it| PerNs::types(it.into(), Visibility::Public))
+        };
 
-        from_crate_root.or(from_extern_prelude)
+        from_crate_root.or_else(from_extern_prelude)
     }
 
     fn resolve_in_prelude(&self, db: &dyn DefDatabase, name: &Name) -> PerNs {

@@ -1,9 +1,12 @@
 #![feature(allow_internal_unstable)]
-#![feature(let_else)]
+#![feature(if_let_guard)]
+#![feature(let_chains)]
 #![feature(never_type)]
 #![feature(proc_macro_diagnostic)]
 #![feature(proc_macro_span)]
 #![allow(rustc::default_hash_types)]
+#![deny(rustc::untranslatable_diagnostic)]
+#![deny(rustc::diagnostic_outside_of_impl)]
 #![recursion_limit = "128"]
 
 use synstructure::decl_derive;
@@ -46,7 +49,7 @@ pub fn symbols(input: TokenStream) -> TokenStream {
 /// `u32::MAX`. You can also customize things like the `Debug` impl,
 /// what traits are derived, and so forth via the macro.
 #[proc_macro]
-#[allow_internal_unstable(step_trait, rustc_attrs, trusted_step)]
+#[allow_internal_unstable(step_trait, rustc_attrs, trusted_step, spec_option_partial_eq)]
 pub fn newtype_index(input: TokenStream) -> TokenStream {
     newtype::newtype(input)
 }
@@ -125,14 +128,12 @@ decl_derive!([TypeFoldable, attributes(type_foldable)] => type_foldable::type_fo
 decl_derive!([TypeVisitable, attributes(type_visitable)] => type_visitable::type_visitable_derive);
 decl_derive!([Lift, attributes(lift)] => lift::lift_derive);
 decl_derive!(
-    [SessionDiagnostic, attributes(
+    [Diagnostic, attributes(
         // struct attributes
-        warning,
-        error,
-        lint,
+        diag,
         help,
         note,
-        warn_,
+        warning,
         // field attributes
         skip_arg,
         primary_span,
@@ -146,12 +147,10 @@ decl_derive!(
 decl_derive!(
     [LintDiagnostic, attributes(
         // struct attributes
-        warning,
-        error,
-        lint,
+        diag,
         help,
         note,
-        warn_,
+        warning,
         // field attributes
         skip_arg,
         primary_span,
@@ -163,18 +162,23 @@ decl_derive!(
         suggestion_verbose)] => diagnostics::lint_diagnostic_derive
 );
 decl_derive!(
-    [SessionSubdiagnostic, attributes(
+    [Subdiagnostic, attributes(
         // struct/variant attributes
         label,
         help,
         note,
-        warn_,
+        warning,
         suggestion,
         suggestion_short,
         suggestion_hidden,
         suggestion_verbose,
+        multipart_suggestion,
+        multipart_suggestion_short,
+        multipart_suggestion_hidden,
+        multipart_suggestion_verbose,
         // field attributes
         skip_arg,
         primary_span,
+        suggestion_part,
         applicability)] => diagnostics::session_subdiagnostic_derive
 );

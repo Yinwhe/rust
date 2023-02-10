@@ -134,6 +134,9 @@ fn result_func(x: Result<i32, i32>) -> Result<i32, i32> {
         return func_returning_result();
     }
 
+    // no warning
+    let _ = if let Err(e) = x { Err(e) } else { Ok(0) };
+
     Ok(y)
 }
 
@@ -207,4 +210,28 @@ fn option_map() -> Option<bool> {
     }
 }
 
+pub struct PatternedError {
+    flag: bool,
+}
+
+// No warning
+fn pattern() -> Result<(), PatternedError> {
+    let res = Ok(());
+
+    if let Err(err @ PatternedError { flag: true }) = res {
+        return Err(err);
+    }
+
+    res
+}
+
 fn main() {}
+
+// should not lint, `?` operator not available in const context
+const fn issue9175(option: Option<()>) -> Option<()> {
+    if option.is_none() {
+        return None;
+    }
+    //stuff
+    Some(())
+}

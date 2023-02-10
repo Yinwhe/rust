@@ -291,9 +291,8 @@
 
 use self::ArmType::*;
 use self::Usefulness::*;
-
-use super::check_match::{joined_uncovered_patterns, pattern_not_covered_label};
 use super::deconstruct_pat::{Constructor, DeconstructedPat, Fields, SplitWildcard};
+use crate::errors::{NonExhaustiveOmittedPattern, Uncovered};
 
 use rustc_data_structures::captures::Captures;
 
@@ -324,7 +323,7 @@ pub(crate) struct MatchCheckCtxt<'p, 'tcx> {
 impl<'a, 'tcx> MatchCheckCtxt<'a, 'tcx> {
     pub(super) fn is_uninhabited(&self, ty: Ty<'tcx>) -> bool {
         if self.tcx.features().exhaustive_patterns {
-            self.tcx.is_ty_uninhabited_from(self.module, ty, self.param_env)
+            !ty.is_inhabited_from(self.tcx, self.module, self.param_env)
         } else {
             false
         }
@@ -364,8 +363,8 @@ impl<'a, 'p, 'tcx> fmt::Debug for PatCtxt<'a, 'p, 'tcx> {
 /// A row of a matrix. Rows of len 1 are very common, which is why `SmallVec[_; 2]`
 /// works well.
 #[derive(Clone)]
-struct PatStack<'p, 'tcx> {
-    pats: SmallVec<[&'p DeconstructedPat<'p, 'tcx>; 2]>,
+pub(crate) struct PatStack<'p, 'tcx> {
+    pub(crate) pats: SmallVec<[&'p DeconstructedPat<'p, 'tcx>; 2]>,
 }
 
 impl<'p, 'tcx> PatStack<'p, 'tcx> {
@@ -403,6 +402,21 @@ impl<'p, 'tcx> PatStack<'p, 'tcx> {
         })
     }
 
+    // Recursively expand all patterns into their subpatterns and push each `PatStack` to matrix.
+    fn expand_and_extend<'a>(&'a self, matrix: &mut Matrix<'p, 'tcx>) {
+        if !self.is_empty() && self.head().is_or_pat() {
+            for pat in self.head().iter_fields() {
+                let mut new_patstack = PatStack::from_pattern(pat);
+                new_patstack.pats.extend_from_slice(&self.pats[1..]);
+                if !new_patstack.is_empty() && new_patstack.head().is_or_pat() {
+                    new_patstack.expand_and_extend(matrix);
+                } else if !new_patstack.is_empty() {
+                    matrix.push(new_patstack);
+                }
+            }
+        }
+    }
+
     /// This computes `S(self.head().ctor(), self)`. See top of the file for explanations.
     ///
     /// Structure patterns with a partial wild pattern (Foo { a: 42, .. }) have their missing
@@ -436,7 +450,7 @@ impl<'p, 'tcx> fmt::Debug for PatStack<'p, 'tcx> {
 /// A 2D matrix.
 #[derive(Clone)]
 pub(super) struct Matrix<'p, 'tcx> {
-    patterns: Vec<PatStack<'p, 'tcx>>,
+    pub patterns: Vec<PatStack<'p, 'tcx>>,
 }
 
 impl<'p, 'tcx> Matrix<'p, 'tcx> {
@@ -453,7 +467,7 @@ impl<'p, 'tcx> Matrix<'p, 'tcx> {
     /// expands it.
     fn push(&mut self, row: PatStack<'p, 'tcx>) {
         if !row.is_empty() && row.head().is_or_pat() {
-            self.patterns.extend(row.expand_or_pat());
+            row.expand_and_extend(self);
         } else {
             self.patterns.push(row);
         }
@@ -728,32 +742,6 @@ impl<'p, 'tcx> Witness<'p, 'tcx> {
     }
 }
 
-/// Report that a match of a `non_exhaustive` enum marked with `non_exhaustive_omitted_patterns`
-/// is not exhaustive enough.
-///
-/// NB: The partner lint for structs lives in `compiler/rustc_typeck/src/check/pat.rs`.
-fn lint_non_exhaustive_omitted_patterns<'p, 'tcx>(
-    cx: &MatchCheckCtxt<'p, 'tcx>,
-    scrut_ty: Ty<'tcx>,
-    sp: Span,
-    hir_id: HirId,
-    witnesses: Vec<DeconstructedPat<'p, 'tcx>>,
-) {
-    let joined_patterns = joined_uncovered_patterns(cx, &witnesses);
-    cx.tcx.struct_span_lint_hir(NON_EXHAUSTIVE_OMITTED_PATTERNS, hir_id, sp, |build| {
-        let mut lint = build.build("some variants are not matched explicitly");
-        lint.span_label(sp, pattern_not_covered_label(&witnesses, &joined_patterns));
-        lint.help(
-            "ensure that all variants are matched explicitly by adding the suggested match arms",
-        );
-        lint.note(&format!(
-            "the matched value is of type `{}` and the `non_exhaustive_omitted_patterns` attribute was found",
-            scrut_ty,
-        ));
-        lint.emit();
-    });
-}
-
 /// Algorithm from <http://moscova.inria.fr/~maranget/papers/warn/index.html>.
 /// The algorithm from the paper has been modified to correctly handle empty
 /// types. The changes are:
@@ -776,7 +764,7 @@ fn lint_non_exhaustive_omitted_patterns<'p, 'tcx>(
 /// `is_under_guard` is used to inform if the pattern has a guard. If it
 /// has one it must not be inserted into the matrix. This shouldn't be
 /// relied on for soundness.
-#[instrument(level = "debug", skip(cx, matrix, hir_id))]
+#[instrument(level = "debug", skip(cx, matrix, hir_id), ret)]
 fn is_useful<'p, 'tcx>(
     cx: &MatchCheckCtxt<'p, 'tcx>,
     matrix: &Matrix<'p, 'tcx>,
@@ -827,7 +815,15 @@ fn is_useful<'p, 'tcx>(
             }
         }
     } else {
-        let ty = v.head().ty();
+        let mut ty = v.head().ty();
+
+        // Opaque types can't get destructured/split, but the patterns can
+        // actually hint at hidden types, so we use the patterns' types instead.
+        if let ty::Alias(ty::Opaque, ..) = ty.kind() {
+            if let Some(row) = rows.first() {
+                ty = row.head().ty();
+            }
+        }
         let is_non_exhaustive = cx.is_foreign_non_exhaustive_enum(ty);
         debug!("v.head: {:?}, v.span: {:?}", v.head(), v.head().span());
         let pcx = &PatCtxt { cx, ty, span: v.head().span(), is_top_level, is_non_exhaustive };
@@ -863,7 +859,7 @@ fn is_useful<'p, 'tcx>(
             // that has the potential to trigger the `non_exhaustive_omitted_patterns` lint.
             // To understand the workings checkout `Constructor::split` and `SplitWildcard::new/into_ctors`
             if is_non_exhaustive_and_wild
-                // We check that the match has a wildcard pattern and that that wildcard is useful,
+                // We check that the match has a wildcard pattern and that wildcard is useful,
                 // meaning there are variants that are covered by the wildcard. Without the check
                 // for `witness_preference` the lint would trigger on `if let NonExhaustiveEnum::A = foo {}`
                 && usefulness.is_useful() && matches!(witness_preference, RealArm)
@@ -891,7 +887,19 @@ fn is_useful<'p, 'tcx>(
                         .collect::<Vec<_>>()
                 };
 
-                lint_non_exhaustive_omitted_patterns(pcx.cx, pcx.ty, pcx.span, hir_id, patterns);
+                // Report that a match of a `non_exhaustive` enum marked with `non_exhaustive_omitted_patterns`
+                // is not exhaustive enough.
+                //
+                // NB: The partner lint for structs lives in `compiler/rustc_hir_analysis/src/check/pat.rs`.
+                cx.tcx.emit_spanned_lint(
+                    NON_EXHAUSTIVE_OMITTED_PATTERNS,
+                    hir_id,
+                    pcx.span,
+                    NonExhaustiveOmittedPattern {
+                        scrut_ty: pcx.ty,
+                        uncovered: Uncovered::new(pcx.span, pcx.cx, patterns),
+                    },
+                );
             }
 
             ret.extend(usefulness);
@@ -902,7 +910,6 @@ fn is_useful<'p, 'tcx>(
         v.head().set_reachable();
     }
 
-    debug!(?ret);
     ret
 }
 

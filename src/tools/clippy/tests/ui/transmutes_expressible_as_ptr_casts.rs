@@ -8,7 +8,7 @@
 
 use std::mem::{size_of, transmute};
 
-// rustc_typeck::check::cast contains documentation about when a cast `e as U` is
+// rustc_hir_analysis::check::cast contains documentation about when a cast `e as U` is
 // valid, which we quote from below.
 fn main() {
     // We should see an error message for each transmute, and no error messages for
@@ -51,6 +51,8 @@ fn main() {
     // e is a function pointer type and U is an integer; fptr-addr-cast
     let _usize_from_fn_ptr_transmute = unsafe { transmute::<fn(usize) -> u8, usize>(foo) };
     let _usize_from_fn_ptr = foo as *const usize;
+
+    let _usize_from_ref = unsafe { transmute::<*const u32, usize>(&1u32) };
 }
 
 // If a ref-to-ptr cast of this form where the pointer type points to a type other

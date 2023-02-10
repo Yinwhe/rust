@@ -1,14 +1,13 @@
 //! Propagates constants for early reporting of statically known
 //! assertion failures
 
-use crate::const_prop::CanConstProp;
-use crate::const_prop::ConstPropMachine;
-use crate::const_prop::ConstPropMode;
-use crate::MirLint;
-use rustc_const_eval::const_eval::ConstEvalErr;
+use std::cell::Cell;
+
+use either::{Left, Right};
+
+use rustc_const_eval::interpret::Immediate;
 use rustc_const_eval::interpret::{
-    self, InterpCx, InterpResult, LocalState, LocalValue, MemoryKind, OpTy, Scalar,
-    ScalarMaybeUninit, StackPopCleanup,
+    self, InterpCx, InterpResult, LocalState, LocalValue, MemoryKind, OpTy, Scalar, StackPopCleanup,
 };
 use rustc_hir::def::DefKind;
 use rustc_hir::HirId;
@@ -16,25 +15,28 @@ use rustc_index::bit_set::BitSet;
 use rustc_index::vec::IndexVec;
 use rustc_middle::mir::visit::Visitor;
 use rustc_middle::mir::{
-    AssertKind, BinOp, Body, Constant, ConstantKind, Local, LocalDecl, Location, Operand, Place,
-    Rvalue, SourceInfo, SourceScope, SourceScopeData, Statement, StatementKind, Terminator,
-    TerminatorKind, UnOp, RETURN_PLACE,
+    AssertKind, BinOp, Body, Constant, Local, LocalDecl, Location, Operand, Place, Rvalue,
+    SourceInfo, SourceScope, SourceScopeData, Statement, StatementKind, Terminator, TerminatorKind,
+    UnOp, RETURN_PLACE,
 };
 use rustc_middle::ty::layout::{LayoutError, LayoutOf, LayoutOfHelpers, TyAndLayout};
-use rustc_middle::ty::subst::{InternalSubsts, Subst};
-use rustc_middle::ty::{
-    self, ConstInt, ConstKind, Instance, ParamEnv, ScalarInt, Ty, TyCtxt, TypeVisitable,
-};
+use rustc_middle::ty::InternalSubsts;
+use rustc_middle::ty::{self, ConstInt, Instance, ParamEnv, ScalarInt, Ty, TyCtxt, TypeVisitable};
 use rustc_session::lint;
 use rustc_span::Span;
 use rustc_target::abi::{HasDataLayout, Size, TargetDataLayout};
 use rustc_trait_selection::traits;
-use std::cell::Cell;
+
+use crate::const_prop::CanConstProp;
+use crate::const_prop::ConstPropMachine;
+use crate::const_prop::ConstPropMode;
+use crate::MirLint;
 
 /// The maximum number of bytes that we'll allocate space for a local or the return value.
 /// Needed for #66397, because otherwise we eval into large places and that can cause OOM or just
 /// Severely regress performance.
 const MAX_ALLOC_LIMIT: u64 = 1024;
+
 pub struct ConstProp;
 
 impl<'tcx> MirLint<'tcx> for ConstProp {
@@ -106,7 +108,7 @@ impl<'tcx> MirLint<'tcx> for ConstProp {
 
         let dummy_body = &Body::new(
             body.source,
-            body.basic_blocks().clone(),
+            (*body.basic_blocks).clone(),
             body.source_scopes.clone(),
             body.local_decls.clone(),
             Default::default(),
@@ -201,7 +203,7 @@ impl<'mir, 'tcx> ConstPropagator<'mir, 'tcx> {
             // I don't know how return types can seem to be unsized but this happens in the
             // `type/type-unsatisfiable.rs` test.
             .filter(|ret_layout| {
-                !ret_layout.is_unsized() && ret_layout.size < Size::from_bytes(MAX_ALLOC_LIMIT)
+                ret_layout.is_sized() && ret_layout.size < Size::from_bytes(MAX_ALLOC_LIMIT)
             })
             .unwrap_or_else(|| ecx.layout_of(tcx.types.unit).unwrap());
 
@@ -230,7 +232,13 @@ impl<'mir, 'tcx> ConstPropagator<'mir, 'tcx> {
 
     fn get_const(&self, place: Place<'tcx>) -> Option<OpTy<'tcx>> {
         let op = match self.ecx.eval_place_to_op(place, None) {
-            Ok(op) => op,
+            Ok(op) => {
+                if matches!(*op, interpret::Operand::Immediate(Immediate::Uninit)) {
+                    // Make sure nobody accidentally uses this value.
+                    return None;
+                }
+                op
+            }
             Err(e) => {
                 trace!("get_const failed: {}", e);
                 return None;
@@ -239,8 +247,8 @@ impl<'mir, 'tcx> ConstPropagator<'mir, 'tcx> {
 
         // Try to read the local as an immediate so that if it is representable as a scalar, we can
         // handle it as such, but otherwise, just return the value as is.
-        Some(match self.ecx.read_immediate_raw(&op, /*force*/ false) {
-            Ok(Ok(imm)) => imm.into(),
+        Some(match self.ecx.read_immediate_raw(&op) {
+            Ok(Left(imm)) => imm.into(),
             _ => op,
         })
     }
@@ -263,7 +271,7 @@ impl<'mir, 'tcx> ConstPropagator<'mir, 'tcx> {
         F: FnOnce(&mut Self) -> InterpResult<'tcx, T>,
     {
         // Overwrite the PC -- whatever the interpreter does to it does not make any sense anyway.
-        self.ecx.frame_mut().loc = Err(source_info.span);
+        self.ecx.frame_mut().loc = Right(source_info.span);
         match f(self) {
             Ok(val) => Some(val),
             Err(error) => {
@@ -288,39 +296,7 @@ impl<'mir, 'tcx> ConstPropagator<'mir, 'tcx> {
             return None;
         }
 
-        match self.ecx.mir_const_to_op(&c.literal, None) {
-            Ok(op) => Some(op),
-            Err(error) => {
-                let tcx = self.ecx.tcx.at(c.span);
-                let err = ConstEvalErr::new(&self.ecx, error, Some(c.span));
-                if let Some(lint_root) = self.lint_root(source_info) {
-                    let lint_only = match c.literal {
-                        ConstantKind::Ty(ct) => match ct.kind() {
-                            // Promoteds must lint and not error as the user didn't ask for them
-                            ConstKind::Unevaluated(ty::Unevaluated {
-                                def: _,
-                                substs: _,
-                                promoted: Some(_),
-                            }) => true,
-                            // Out of backwards compatibility we cannot report hard errors in unused
-                            // generic functions using associated constants of the generic parameters.
-                            _ => c.literal.needs_subst(),
-                        },
-                        ConstantKind::Val(_, ty) => ty.needs_subst(),
-                    };
-                    if lint_only {
-                        // Out of backwards compatibility we cannot report hard errors in unused
-                        // generic functions using associated constants of the generic parameters.
-                        err.report_as_lint(tcx, "erroneous constant used", lint_root, Some(c.span));
-                    } else {
-                        err.report_as_error(tcx, "erroneous constant used");
-                    }
-                } else {
-                    err.report_as_error(tcx, "erroneous constant used");
-                }
-                None
-            }
-        }
+        self.use_ecx(source_info, |this| this.ecx.eval_mir_constant(&c.literal, Some(c.span), None))
     }
 
     /// Returns the value, if any, of evaluating `place`.
@@ -346,10 +322,8 @@ impl<'mir, 'tcx> ConstPropagator<'mir, 'tcx> {
         panic: AssertKind<impl std::fmt::Debug>,
     ) {
         if let Some(lint_root) = self.lint_root(source_info) {
-            self.tcx.struct_span_lint_hir(lint, lint_root, source_info.span, |lint| {
-                let mut err = lint.build(message);
-                err.span_label(source_info.span, format!("{:?}", panic));
-                err.emit();
+            self.tcx.struct_span_lint_hir(lint, lint_root, source_info.span, message, |lint| {
+                lint.span_label(source_info.span, format!("{:?}", panic))
             });
         }
     }
@@ -394,15 +368,14 @@ impl<'mir, 'tcx> ConstPropagator<'mir, 'tcx> {
             this.ecx.read_immediate(&this.ecx.eval_operand(left, None)?)
         });
         // Check for exceeding shifts *even if* we cannot evaluate the LHS.
-        if op == BinOp::Shr || op == BinOp::Shl {
+        if matches!(op, BinOp::Shr | BinOp::Shl) {
             let r = r.clone()?;
             // We need the type of the LHS. We cannot use `place_layout` as that is the type
             // of the result, which for checked binops is not the same!
             let left_ty = left.ty(self.local_decls, self.tcx);
             let left_size = self.ecx.layout_of(left_ty).ok()?.size;
             let right_size = r.layout.size;
-            let r_bits = r.to_scalar().ok();
-            let r_bits = r_bits.and_then(|r| r.to_bits(right_size).ok());
+            let r_bits = r.to_scalar().to_bits(right_size).ok();
             if r_bits.map_or(false, |b| b >= left_size.bits() as u128) {
                 debug!("check_binary_op: reporting assert for {:?}", source_info);
                 self.report_assert_as_lint(
@@ -517,6 +490,14 @@ impl<'mir, 'tcx> ConstPropagator<'mir, 'tcx> {
         if rvalue.needs_subst() {
             return None;
         }
+        if !rvalue
+            .ty(&self.ecx.frame().body.local_decls, *self.ecx.tcx)
+            .is_sized(*self.ecx.tcx, self.param_env)
+        {
+            // the interpreter doesn't support unsized locals (only unsized arguments),
+            // but rustc does (in a kinda broken way), so we have to skip them here
+            return None;
+        }
 
         self.use_ecx(source_info, |this| this.ecx.eval_rvalue_into_place(rvalue, place))
     }
@@ -524,7 +505,7 @@ impl<'mir, 'tcx> ConstPropagator<'mir, 'tcx> {
 
 impl<'tcx> Visitor<'tcx> for ConstPropagator<'_, 'tcx> {
     fn visit_body(&mut self, body: &Body<'tcx>) {
-        for (bb, data) in body.basic_blocks().iter_enumerated() {
+        for (bb, data) in body.basic_blocks.iter_enumerated() {
             self.visit_basic_block_data(bb, data);
         }
     }
@@ -625,8 +606,12 @@ impl<'tcx> Visitor<'tcx> for ConstPropagator<'_, 'tcx> {
             TerminatorKind::Assert { expected, ref msg, ref cond, .. } => {
                 if let Some(ref value) = self.eval_operand(&cond, source_info) {
                     trace!("assertion on {:?} should be {:?}", value, expected);
-                    let expected = ScalarMaybeUninit::from(Scalar::from_bool(*expected));
-                    let value_const = self.ecx.read_scalar(&value).unwrap();
+                    let expected = Scalar::from_bool(*expected);
+                    let Ok(value_const) = self.ecx.read_scalar(&value) else {
+                        // FIXME should be used use_ecx rather than a local match... but we have
+                        // quite a few of these read_scalar/read_immediate that need fixing.
+                        return
+                    };
                     if expected != value_const {
                         enum DbgVal<T> {
                             Val(T),
@@ -643,9 +628,9 @@ impl<'tcx> Visitor<'tcx> for ConstPropagator<'_, 'tcx> {
                         let mut eval_to_int = |op| {
                             // This can be `None` if the lhs wasn't const propagated and we just
                             // triggered the assert on the value of the rhs.
-                            self.eval_operand(op, source_info).map_or(DbgVal::Underscore, |op| {
-                                DbgVal::Val(self.ecx.read_immediate(&op).unwrap().to_const_int())
-                            })
+                            self.eval_operand(op, source_info)
+                                .and_then(|op| self.ecx.read_immediate(&op).ok())
+                                .map_or(DbgVal::Underscore, |op| DbgVal::Val(op.to_const_int()))
                         };
                         let msg = match msg {
                             AssertKind::DivisionByZero(op) => {

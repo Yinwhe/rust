@@ -2,12 +2,13 @@
 
 use rustc_data_structures::fx::FxHashSet;
 use rustc_hir::def_id::DefId;
-use rustc_middle::ty::subst::Subst;
 use rustc_middle::ty::subst::SubstsRef;
 use rustc_middle::ty::util::{needs_drop_components, AlwaysRequiresDrop};
 use rustc_middle::ty::{self, EarlyBinder, Ty, TyCtxt};
 use rustc_session::Limit;
 use rustc_span::{sym, DUMMY_SP};
+
+use crate::errors::NeedsDropOverflow;
 
 type NeedsDropResult<T> = Result<T, AlwaysRequiresDrop>;
 
@@ -90,10 +91,7 @@ where
             if !self.recursion_limit.value_within_limit(level) {
                 // Not having a `Span` isn't great. But there's hopefully some other
                 // recursion limit error as well.
-                tcx.sess.span_err(
-                    DUMMY_SP,
-                    &format!("overflow while checking whether `{}` requires drop", self.query_ty),
-                );
+                tcx.sess.emit_err(NeedsDropOverflow { query_ty: self.query_ty });
                 return Some(Err(AlwaysRequiresDrop));
             }
 
@@ -111,7 +109,14 @@ where
 
             for component in components {
                 match *component.kind() {
-                    _ if component.is_copy_modulo_regions(tcx.at(DUMMY_SP), self.param_env) => (),
+                    // The information required to determine whether a generator has drop is
+                    // computed on MIR, while this very method is used to build MIR.
+                    // To avoid cycles, we consider that generators always require drop.
+                    ty::Generator(..) if tcx.sess.opts.unstable_opts.drop_tracking_mir => {
+                        return Some(Err(AlwaysRequiresDrop));
+                    }
+
+                    _ if component.is_copy_modulo_regions(tcx, self.param_env) => (),
 
                     ty::Closure(_, substs) => {
                         queue_type(self, substs.as_closure().tupled_upvars_ty());
@@ -154,7 +159,7 @@ where
                             queue_type(self, required);
                         }
                     }
-                    ty::Array(..) | ty::Opaque(..) | ty::Projection(..) | ty::Param(_) => {
+                    ty::Array(..) | ty::Alias(..) | ty::Param(_) => {
                         if ty == component {
                             // Return the type to the caller: they may be able
                             // to normalize further than we can.
@@ -266,7 +271,7 @@ fn adt_consider_insignificant_dtor<'tcx>(
         if is_marked_insig {
             // In some cases like `std::collections::HashMap` where the struct is a wrapper around
             // a type that is a Drop type, and the wrapped type (eg: `hashbrown::HashMap`) lies
-            // outside stdlib, we might choose to still annotate the the wrapper (std HashMap) with
+            // outside stdlib, we might choose to still annotate the wrapper (std HashMap) with
             // `rustc_insignificant_dtor`, even if the type itself doesn't have a `Drop` impl.
             Some(DtorType::Insignificant)
         } else if adt_def.destructor(tcx).is_some() {

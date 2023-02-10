@@ -611,7 +611,19 @@ mod prim_pointer {}
 ///
 /// Arrays coerce to [slices (`[T]`)][slice], so a slice method may be called on
 /// an array. Indeed, this provides most of the API for working with arrays.
-/// Slices have a dynamic size and do not coerce to arrays.
+///
+/// Slices have a dynamic size and do not coerce to arrays. Instead, use
+/// `slice.try_into().unwrap()` or `<ArrayType>::try_from(slice).unwrap()`.
+///
+/// Array's `try_from(slice)` implementations (and the corresponding `slice.try_into()`
+/// array implementations) succeed if the input slice length is the same as the result
+/// array length. They optimize especially well when the optimizer can easily determine
+/// the slice length, e.g. `<[u8; 4]>::try_from(&slice[4..8]).unwrap()`. Array implements
+/// [TryFrom](crate::convert::TryFrom) returning:
+///
+/// - `[T; N]` copies from the slice's elements
+/// - `&[T; N]` references the original slice's elements
+/// - `&mut [T; N]` references the original slice's elements
 ///
 /// You can move elements out of an array with a [slice pattern]. If you want
 /// one element, see [`mem::replace`].
@@ -638,6 +650,15 @@ mod prim_pointer {}
 /// let array: [i32; 3] = [0; 3];
 ///
 /// for x in &array { }
+/// ```
+///
+/// You can use `<ArrayType>::try_from(slice)` or `slice.try_into()` to get an array from
+/// a slice:
+///
+/// ```
+/// let bytes: [u8; 3] = [1, 0, 2];
+/// assert_eq!(1, u16::from_le_bytes(<[u8; 2]>::try_from(&bytes[0..2]).unwrap()));
+/// assert_eq!(512, u16::from_le_bytes(bytes[1..3].try_into().unwrap()));
 /// ```
 ///
 /// You can use a [slice pattern] to move elements out of an array:
@@ -801,11 +822,53 @@ mod prim_array {}
 /// assert_eq!(2 * pointer_size, std::mem::size_of::<Box<[u8]>>());
 /// assert_eq!(2 * pointer_size, std::mem::size_of::<Rc<[u8]>>());
 /// ```
+///
+/// ## Trait Implementations
+///
+/// Some traits are implemented for slices if the element type implements
+/// that trait. This includes [`Eq`], [`Hash`] and [`Ord`].
+///
+/// ## Iteration
+///
+/// The slices implement `IntoIterator`. The iterator yields references to the
+/// slice elements.
+///
+/// ```
+/// let numbers: &[i32] = &[0, 1, 2];
+/// for n in numbers {
+///     println!("{n} is a number!");
+/// }
+/// ```
+///
+/// The mutable slice yields mutable references to the elements:
+///
+/// ```
+/// let mut scores: &mut [i32] = &mut [7, 8, 9];
+/// for score in scores {
+///     *score += 1;
+/// }
+/// ```
+///
+/// This iterator yields mutable references to the slice's elements, so while
+/// the element type of the slice is `i32`, the element type of the iterator is
+/// `&mut i32`.
+///
+/// * [`.iter`] and [`.iter_mut`] are the explicit methods to return the default
+///   iterators.
+/// * Further methods that return iterators are [`.split`], [`.splitn`],
+///   [`.chunks`], [`.windows`] and more.
+///
+/// [`Hash`]: core::hash::Hash
+/// [`.iter`]: slice::iter
+/// [`.iter_mut`]: slice::iter_mut
+/// [`.split`]: slice::split
+/// [`.splitn`]: slice::splitn
+/// [`.chunks`]: slice::chunks
+/// [`.windows`]: slice::windows
 #[stable(feature = "rust1", since = "1.0.0")]
 mod prim_slice {}
 
 #[doc(primitive = "str")]
-//
 /// String slices.
 ///
 /// *[See also the `std::str` module](crate::str).*
@@ -816,19 +879,22 @@ mod prim_slice {}
 ///
 /// String slices are always valid UTF-8.
 ///
-/// # Examples
+/// # Basic Usage
 ///
 /// String literals are string slices:
 ///
 /// ```
-/// let hello = "Hello, world!";
-///
-/// // with an explicit type annotation
-/// let hello: &'static str = "Hello, world!";
+/// let hello_world = "Hello, World!";
 /// ```
 ///
-/// They are `'static` because they're stored directly in the final binary, and
-/// so will be valid for the `'static` duration.
+/// Here we have declared a string slice initialized with a string literal.
+/// String literals have a static lifetime, which means the string `hello_world`
+/// is guaranteed to be valid for the duration of the entire program.
+/// We can explicitly specify `hello_world`'s lifetime as well:
+///
+/// ```
+/// let hello_world: &'static str = "Hello, world!";
+/// ```
 ///
 /// # Representation
 ///
@@ -1178,7 +1244,7 @@ mod prim_usize {}
 #[doc(alias = "&")]
 #[doc(alias = "&mut")]
 //
-/// References, both shared and mutable.
+/// References, `&T` and `&mut T`.
 ///
 /// A reference represents a borrow of some owned value. You can get one by using the `&` or `&mut`
 /// operators on a value, or by using a [`ref`](../std/keyword.ref.html) or
@@ -1427,11 +1493,13 @@ mod prim_ref {}
 /// However, a direct cast back is not possible. You need to use `transmute`:
 ///
 /// ```rust
+/// # #[cfg(not(miri))] { // FIXME: use strict provenance APIs once they are stable, then remove this `cfg`
 /// # let fnptr: fn(i32) -> i32 = |x| x+2;
 /// # let fnptr_addr = fnptr as usize;
 /// let fnptr = fnptr_addr as *const ();
 /// let fnptr: fn(i32) -> i32 = unsafe { std::mem::transmute(fnptr) };
 /// assert_eq!(fnptr(40), 42);
+/// # }
 /// ```
 ///
 /// Crucially, we `as`-cast to a raw pointer before `transmute`ing to a function pointer.

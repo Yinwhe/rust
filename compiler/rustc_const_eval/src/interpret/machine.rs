@@ -6,11 +6,14 @@ use std::borrow::{Borrow, Cow};
 use std::fmt::Debug;
 use std::hash::Hash;
 
+use rustc_ast::{InlineAsmOptions, InlineAsmTemplatePiece};
 use rustc_middle::mir;
 use rustc_middle::ty::{self, Ty, TyCtxt};
 use rustc_span::def_id::DefId;
-use rustc_target::abi::Size;
+use rustc_target::abi::{Align, Size};
 use rustc_target::spec::abi::Abi as CallAbi;
+
+use crate::const_eval::CheckAlignment;
 
 use super::{
     AllocId, AllocRange, Allocation, ConstAllocation, Frame, ImmTy, InterpCx, InterpResult,
@@ -121,19 +124,23 @@ pub trait Machine<'mir, 'tcx>: Sized {
     const PANIC_ON_ALLOC_FAIL: bool;
 
     /// Whether memory accesses should be alignment-checked.
-    fn enforce_alignment(ecx: &InterpCx<'mir, 'tcx, Self>) -> bool;
+    fn enforce_alignment(ecx: &InterpCx<'mir, 'tcx, Self>) -> CheckAlignment;
 
-    /// Whether, when checking alignment, we should `force_int` and thus support
+    /// Whether, when checking alignment, we should look at the actual address and thus support
     /// custom alignment logic based on whatever the integer address happens to be.
     ///
-    /// Requires Provenance::OFFSET_IS_ADDR to be true.
-    fn force_int_for_alignment_check(ecx: &InterpCx<'mir, 'tcx, Self>) -> bool;
+    /// If this returns true, Provenance::OFFSET_IS_ADDR must be true.
+    fn use_addr_for_alignment_check(ecx: &InterpCx<'mir, 'tcx, Self>) -> bool;
+
+    fn alignment_check_failed(
+        ecx: &InterpCx<'mir, 'tcx, Self>,
+        has: Align,
+        required: Align,
+        check: CheckAlignment,
+    ) -> InterpResult<'tcx, ()>;
 
     /// Whether to enforce the validity invariant
     fn enforce_validity(ecx: &InterpCx<'mir, 'tcx, Self>) -> bool;
-
-    /// Whether to enforce integers and floats being initialized.
-    fn enforce_number_init(ecx: &InterpCx<'mir, 'tcx, Self>) -> bool;
 
     /// Whether function calls should be [ABI](CallAbi)-checked.
     fn enforce_abi(_ecx: &InterpCx<'mir, 'tcx, Self>) -> bool {
@@ -173,7 +180,7 @@ pub trait Machine<'mir, 'tcx>: Sized {
         unwind: StackPopUnwind,
     ) -> InterpResult<'tcx, Option<(&'mir mir::Body<'tcx>, ty::Instance<'tcx>)>>;
 
-    /// Execute `fn_val`.  It is the hook's responsibility to advance the instruction
+    /// Execute `fn_val`. It is the hook's responsibility to advance the instruction
     /// pointer as appropriate.
     fn call_extra_fn(
         ecx: &mut InterpCx<'mir, 'tcx, Self>,
@@ -218,23 +225,12 @@ pub trait Machine<'mir, 'tcx>: Sized {
         right: &ImmTy<'tcx, Self::Provenance>,
     ) -> InterpResult<'tcx, (Scalar<Self::Provenance>, bool, Ty<'tcx>)>;
 
-    /// Called to read the specified `local` from the `frame`.
-    /// Since reading a ZST is not actually accessing memory or locals, this is never invoked
-    /// for ZST reads.
-    #[inline]
-    fn access_local<'a>(
-        frame: &'a Frame<'mir, 'tcx, Self::Provenance, Self::FrameExtra>,
-        local: mir::Local,
-    ) -> InterpResult<'tcx, &'a Operand<Self::Provenance>>
-    where
-        'tcx: 'mir,
-    {
-        frame.locals[local].access()
-    }
-
     /// Called to write the specified `local` from the `frame`.
     /// Since writing a ZST is not actually accessing memory or locals, this is never invoked
     /// for ZST reads.
+    ///
+    /// Due to borrow checker trouble, we indicate the `frame` as an index rather than an `&mut
+    /// Frame`.
     #[inline]
     fn access_local_mut<'a>(
         ecx: &'a mut InterpCx<'mir, 'tcx, Self>,
@@ -248,9 +244,15 @@ pub trait Machine<'mir, 'tcx>: Sized {
     }
 
     /// Called before a basic block terminator is executed.
-    /// You can use this to detect endlessly running programs.
     #[inline]
     fn before_terminator(_ecx: &mut InterpCx<'mir, 'tcx, Self>) -> InterpResult<'tcx> {
+        Ok(())
+    }
+
+    /// Called when the interpreter encounters a `StatementKind::ConstEvalCounter` instruction.
+    /// You can use this to detect long or endlessly running programs.
+    #[inline]
+    fn increment_const_eval_counter(_ecx: &mut InterpCx<'mir, 'tcx, Self>) -> InterpResult<'tcx> {
         Ok(())
     }
 
@@ -289,7 +291,7 @@ pub trait Machine<'mir, 'tcx>: Sized {
     fn adjust_alloc_base_pointer(
         ecx: &InterpCx<'mir, 'tcx, Self>,
         ptr: Pointer,
-    ) -> Pointer<Self::Provenance>;
+    ) -> InterpResult<'tcx, Pointer<Self::Provenance>>;
 
     /// "Int-to-pointer cast"
     fn ptr_from_addr_cast(
@@ -329,13 +331,22 @@ pub trait Machine<'mir, 'tcx>: Sized {
     /// cache the result. (This relies on `AllocMap::get_or` being able to add the
     /// owned allocation to the map even when the map is shared.)
     ///
-    /// This must only fail if `alloc` contains relocations.
+    /// This must only fail if `alloc` contains provenance.
     fn adjust_allocation<'b>(
         ecx: &InterpCx<'mir, 'tcx, Self>,
         id: AllocId,
         alloc: Cow<'b, Allocation>,
         kind: Option<MemoryKind<Self::MemoryKind>>,
     ) -> InterpResult<'tcx, Cow<'b, Allocation<Self::Provenance, Self::AllocExtra>>>;
+
+    fn eval_inline_asm(
+        _ecx: &mut InterpCx<'mir, 'tcx, Self>,
+        _template: &'tcx [InlineAsmTemplatePiece],
+        _operands: &[mir::InlineAsmOperand<'tcx>],
+        _options: InlineAsmOptions,
+    ) -> InterpResult<'tcx> {
+        throw_unsup_format!("inline assembly is not supported")
+    }
 
     /// Hook for performing extra checks on a memory read access.
     ///
@@ -377,9 +388,21 @@ pub trait Machine<'mir, 'tcx>: Sized {
         Ok(())
     }
 
-    /// Executes a retagging operation.
+    /// Executes a retagging operation for a single pointer.
+    /// Returns the possibly adjusted pointer.
     #[inline]
-    fn retag(
+    fn retag_ptr_value(
+        _ecx: &mut InterpCx<'mir, 'tcx, Self>,
+        _kind: mir::RetagKind,
+        val: &ImmTy<'tcx, Self::Provenance>,
+    ) -> InterpResult<'tcx, ImmTy<'tcx, Self::Provenance>> {
+        Ok(val.clone())
+    }
+
+    /// Executes a retagging operation on a compound value.
+    /// Replaces all pointers stored in the given place.
+    #[inline]
+    fn retag_place_contents(
         _ecx: &mut InterpCx<'mir, 'tcx, Self>,
         _kind: mir::RetagKind,
         _place: &PlaceTy<'tcx, Self::Provenance>,
@@ -421,8 +444,8 @@ pub trait Machine<'mir, 'tcx>: Sized {
     }
 }
 
-// A lot of the flexibility above is just needed for `Miri`, but all "compile-time" machines
-// (CTFE and ConstProp) use the same instance.  Here, we share that code.
+/// A lot of the flexibility above is just needed for `Miri`, but all "compile-time" machines
+/// (CTFE and ConstProp) use the same instance. Here, we share that code.
 pub macro compile_time_machine(<$mir: lifetime, $tcx: lifetime>) {
     type Provenance = AllocId;
     type ProvenanceExtra = ();
@@ -430,21 +453,16 @@ pub macro compile_time_machine(<$mir: lifetime, $tcx: lifetime>) {
     type ExtraFnVal = !;
 
     type MemoryMap =
-        rustc_data_structures::fx::FxHashMap<AllocId, (MemoryKind<Self::MemoryKind>, Allocation)>;
+        rustc_data_structures::fx::FxIndexMap<AllocId, (MemoryKind<Self::MemoryKind>, Allocation)>;
     const GLOBAL_KIND: Option<Self::MemoryKind> = None; // no copying of globals from `tcx` to machine memory
 
     type AllocExtra = ();
     type FrameExtra = ();
 
     #[inline(always)]
-    fn force_int_for_alignment_check(_ecx: &InterpCx<$mir, $tcx, Self>) -> bool {
-        // We do not support `force_int`.
+    fn use_addr_for_alignment_check(_ecx: &InterpCx<$mir, $tcx, Self>) -> bool {
+        // We do not support `use_addr`.
         false
-    }
-
-    #[inline(always)]
-    fn enforce_number_init(_ecx: &InterpCx<$mir, $tcx, Self>) -> bool {
-        true
     }
 
     #[inline(always)]
@@ -487,8 +505,8 @@ pub macro compile_time_machine(<$mir: lifetime, $tcx: lifetime>) {
     fn adjust_alloc_base_pointer(
         _ecx: &InterpCx<$mir, $tcx, Self>,
         ptr: Pointer<AllocId>,
-    ) -> Pointer<AllocId> {
-        ptr
+    ) -> InterpResult<$tcx, Pointer<AllocId>> {
+        Ok(ptr)
     }
 
     #[inline(always)]
@@ -498,6 +516,7 @@ pub macro compile_time_machine(<$mir: lifetime, $tcx: lifetime>) {
     ) -> InterpResult<$tcx, Pointer<Option<AllocId>>> {
         // Allow these casts, but make the pointer not dereferenceable.
         // (I.e., they behave like transmutation.)
+        // This is correct because no pointers can ever be exposed in compile-time evaluation.
         Ok(Pointer::from_addr(addr))
     }
 

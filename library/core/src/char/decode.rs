@@ -1,5 +1,6 @@
 //! UTF-8 and UTF-16 decoding iterators
 
+use crate::error::Error;
 use crate::fmt;
 
 use super::from_u32_unchecked;
@@ -66,7 +67,7 @@ impl<I: Iterator<Item = u16>> Iterator for DecodeUtf16<I> {
             }
 
             // all ok, so lets decode it.
-            let c = (((u - 0xD800) as u32) << 10 | (u2 - 0xDC00) as u32) + 0x1_0000;
+            let c = (((u & 0x3ff) as u32) << 10 | (u2 & 0x3ff) as u32) + 0x1_0000;
             // SAFETY: we checked that it's a legal unicode value
             Some(Ok(unsafe { from_u32_unchecked(c) }))
         }
@@ -119,5 +120,13 @@ impl DecodeUtf16Error {
 impl fmt::Display for DecodeUtf16Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "unpaired surrogate found: {:x}", self.code)
+    }
+}
+
+#[stable(feature = "decode_utf16", since = "1.9.0")]
+impl Error for DecodeUtf16Error {
+    #[allow(deprecated)]
+    fn description(&self) -> &str {
+        "unpaired surrogate found"
     }
 }

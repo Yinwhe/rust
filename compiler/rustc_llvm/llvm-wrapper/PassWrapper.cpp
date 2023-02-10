@@ -21,6 +21,9 @@
 #include "llvm/Passes/StandardInstrumentations.h"
 #include "llvm/Support/CBindingWrapping.h"
 #include "llvm/Support/FileSystem.h"
+#if LLVM_VERSION_GE(17, 0)
+#include "llvm/Support/VirtualFileSystem.h"
+#endif
 #include "llvm/Support/Host.h"
 #if LLVM_VERSION_LT(14, 0)
 #include "llvm/Support/TargetRegistry.h"
@@ -31,10 +34,12 @@
 #include "llvm/Transforms/IPO/PassManagerBuilder.h"
 #include "llvm/Transforms/IPO/AlwaysInliner.h"
 #include "llvm/Transforms/IPO/FunctionImport.h"
+#include "llvm/Transforms/IPO/Internalize.h"
+#include "llvm/Transforms/IPO/ThinLTOBitcodeWriter.h"
 #include "llvm/Transforms/Utils/AddDiscriminators.h"
 #include "llvm/Transforms/Utils/FunctionImportUtils.h"
 #include "llvm/LTO/LTO.h"
-#include "llvm/Bitcode/BitcodeWriterPass.h"
+#include "llvm/Bitcode/BitcodeWriter.h"
 #include "llvm-c/Transforms/PassManagerBuilder.h"
 
 #include "llvm/Transforms/Instrumentation.h"
@@ -67,7 +72,9 @@ extern "C" void LLVMInitializePasses() {
   initializeAnalysis(Registry);
   initializeTransformUtils(Registry);
   initializeInstCombine(Registry);
+#if LLVM_VERSION_LT(16, 0)
   initializeInstrumentation(Registry);
+#endif
   initializeTarget(Registry);
 }
 
@@ -88,167 +95,6 @@ extern "C" void LLVMTimeTraceProfilerFinish(const char* FileName) {
 
   timeTraceProfilerWrite(OS);
   timeTraceProfilerCleanup();
-}
-
-extern "C" LLVMPassRef LLVMRustFindAndCreatePass(const char *PassName) {
-#if LLVM_VERSION_LT(15, 0)
-  StringRef SR(PassName);
-  PassRegistry *PR = PassRegistry::getPassRegistry();
-
-  const PassInfo *PI = PR->getPassInfo(SR);
-  if (PI) {
-    return wrap(PI->createPass());
-  }
-  return nullptr;
-#else
-  report_fatal_error("Legacy PM not supported with LLVM 15");
-#endif
-}
-
-extern "C" LLVMPassRef LLVMRustCreateAddressSanitizerFunctionPass(bool Recover) {
-#if LLVM_VERSION_LT(15, 0)
-  const bool CompileKernel = false;
-  const bool UseAfterScope = true;
-
-  return wrap(createAddressSanitizerFunctionPass(CompileKernel, Recover, UseAfterScope));
-#else
-  report_fatal_error("Legacy PM not supported with LLVM 15");
-#endif
-}
-
-extern "C" LLVMPassRef LLVMRustCreateModuleAddressSanitizerPass(bool Recover) {
-#if LLVM_VERSION_LT(15, 0)
-  const bool CompileKernel = false;
-
-  return wrap(createModuleAddressSanitizerLegacyPassPass(CompileKernel, Recover));
-#else
-  report_fatal_error("Legacy PM not supported with LLVM 15");
-#endif
-}
-
-extern "C" LLVMPassRef LLVMRustCreateMemorySanitizerPass(int TrackOrigins, bool Recover) {
-#if LLVM_VERSION_LT(15, 0)
-  const bool CompileKernel = false;
-
-  return wrap(createMemorySanitizerLegacyPassPass(
-      MemorySanitizerOptions{TrackOrigins, Recover, CompileKernel}));
-#else
-  report_fatal_error("Legacy PM not supported with LLVM 15");
-#endif
-}
-
-extern "C" LLVMPassRef LLVMRustCreateThreadSanitizerPass() {
-#if LLVM_VERSION_LT(15, 0)
-  return wrap(createThreadSanitizerLegacyPassPass());
-#else
-  report_fatal_error("Legacy PM not supported with LLVM 15");
-#endif
-}
-
-extern "C" LLVMPassRef LLVMRustCreateHWAddressSanitizerPass(bool Recover) {
-#if LLVM_VERSION_LT(15, 0)
-  const bool CompileKernel = false;
-
-  return wrap(createHWAddressSanitizerLegacyPassPass(CompileKernel, Recover));
-#else
-  report_fatal_error("Legacy PM not supported with LLVM 15");
-#endif
-}
-
-extern "C" void LLVMRustAddPass(LLVMPassManagerRef PMR, LLVMPassRef RustPass) {
-#if LLVM_VERSION_LT(15, 0)
-  assert(RustPass);
-  Pass *Pass = unwrap(RustPass);
-  PassManagerBase *PMB = unwrap(PMR);
-  PMB->add(Pass);
-#else
-  report_fatal_error("Legacy PM not supported with LLVM 15");
-#endif
-}
-
-extern "C" LLVMPassManagerBuilderRef LLVMRustPassManagerBuilderCreate() {
-#if LLVM_VERSION_LT(15, 0)
-  return LLVMPassManagerBuilderCreate();
-#else
-  report_fatal_error("Legacy PM not supported with LLVM 15");
-#endif
-}
-
-extern "C" void LLVMRustPassManagerBuilderDispose(LLVMPassManagerBuilderRef PMB) {
-#if LLVM_VERSION_LT(15, 0)
-  LLVMPassManagerBuilderDispose(PMB);
-#else
-  report_fatal_error("Legacy PM not supported with LLVM 15");
-#endif
-}
-
-extern "C" void LLVMRustPassManagerBuilderPopulateFunctionPassManager(
-  LLVMPassManagerBuilderRef PMB, LLVMPassManagerRef PM) {
-#if LLVM_VERSION_LT(15, 0)
-  LLVMPassManagerBuilderPopulateFunctionPassManager(PMB, PM);
-#else
-  report_fatal_error("Legacy PM not supported with LLVM 15");
-#endif
-}
-
-extern "C" void LLVMRustPassManagerBuilderPopulateModulePassManager(
-  LLVMPassManagerBuilderRef PMB, LLVMPassManagerRef PM) {
-#if LLVM_VERSION_LT(15, 0)
-  LLVMPassManagerBuilderPopulateModulePassManager(PMB, PM);
-#else
-  report_fatal_error("Legacy PM not supported with LLVM 15");
-#endif
-}
-
-extern "C" void LLVMRustPassManagerBuilderPopulateLTOPassManager(
-  LLVMPassManagerBuilderRef PMB, LLVMPassManagerRef PM, bool Internalize, bool RunInliner) {
-#if LLVM_VERSION_LT(15, 0)
-  LLVMPassManagerBuilderPopulateLTOPassManager(PMB, PM, Internalize, RunInliner);
-#else
-  report_fatal_error("Legacy PM not supported with LLVM 15");
-#endif
-}
-
-extern "C"
-void LLVMRustPassManagerBuilderPopulateThinLTOPassManager(
-  LLVMPassManagerBuilderRef PMBR,
-  LLVMPassManagerRef PMR
-) {
-#if LLVM_VERSION_LT(15, 0)
-  unwrap(PMBR)->populateThinLTOPassManager(*unwrap(PMR));
-#else
-  report_fatal_error("Legacy PM not supported with LLVM 15");
-#endif
-}
-
-extern "C" void LLVMRustPassManagerBuilderUseInlinerWithThreshold(
-  LLVMPassManagerBuilderRef PMB, unsigned Threshold) {
-#if LLVM_VERSION_LT(15, 0)
-  LLVMPassManagerBuilderUseInlinerWithThreshold(PMB, Threshold);
-#else
-  report_fatal_error("Legacy PM not supported with LLVM 15");
-#endif
-}
-
-extern "C"
-void LLVMRustAddLastExtensionPasses(
-    LLVMPassManagerBuilderRef PMBR, LLVMPassRef *Passes, size_t NumPasses) {
-#if LLVM_VERSION_LT(15, 0)
-  auto AddExtensionPasses = [Passes, NumPasses](
-      const PassManagerBuilder &Builder, PassManagerBase &PM) {
-    for (size_t I = 0; I < NumPasses; I++) {
-      PM.add(unwrap(Passes[I]));
-    }
-  };
-  // Add the passes to both of the pre-finalization extension points,
-  // so they are run for optimized and non-optimized builds.
-  unwrap(PMBR)->addExtension(PassManagerBuilder::EP_OptimizerLast,
-                             AddExtensionPasses);
-  unwrap(PMBR)->addExtension(PassManagerBuilder::EP_EnabledOnOptLevel0,
-                             AddExtensionPasses);
-#else
-  report_fatal_error("Legacy PM not supported with LLVM 15");
-#endif
 }
 
 #ifdef LLVM_COMPONENT_X86
@@ -362,7 +208,12 @@ enum class LLVMRustCodeModel {
   None,
 };
 
-static Optional<CodeModel::Model> fromRust(LLVMRustCodeModel Model) {
+#if LLVM_VERSION_LT(16, 0)
+static Optional<CodeModel::Model>
+#else
+static std::optional<CodeModel::Model>
+#endif
+fromRust(LLVMRustCodeModel Model) {
   switch (Model) {
   case LLVMRustCodeModel::Tiny:
     return CodeModel::Tiny;
@@ -375,7 +226,11 @@ static Optional<CodeModel::Model> fromRust(LLVMRustCodeModel Model) {
   case LLVMRustCodeModel::Large:
     return CodeModel::Large;
   case LLVMRustCodeModel::None:
+#if LLVM_VERSION_LT(16, 0)
     return None;
+#else
+    return std::nullopt;
+#endif
   default:
     report_fatal_error("Bad CodeModel.");
   }
@@ -596,47 +451,6 @@ extern "C" void LLVMRustDisposeTargetMachine(LLVMTargetMachineRef TM) {
   delete unwrap(TM);
 }
 
-extern "C" void LLVMRustConfigurePassManagerBuilder(
-    LLVMPassManagerBuilderRef PMBR, LLVMRustCodeGenOptLevel OptLevel,
-    bool MergeFunctions, bool SLPVectorize, bool LoopVectorize, bool PrepareForThinLTO,
-    const char* PGOGenPath, const char* PGOUsePath, const char* PGOSampleUsePath,
-    int SizeLevel) {
-#if LLVM_VERSION_LT(15, 0)
-  unwrap(PMBR)->MergeFunctions = MergeFunctions;
-  unwrap(PMBR)->SLPVectorize = SLPVectorize;
-  unwrap(PMBR)->OptLevel = fromRust(OptLevel);
-  unwrap(PMBR)->LoopVectorize = LoopVectorize;
-  unwrap(PMBR)->PrepareForThinLTO = PrepareForThinLTO;
-  unwrap(PMBR)->SizeLevel = SizeLevel;
-  unwrap(PMBR)->DisableUnrollLoops = SizeLevel != 0;
-
-  if (PGOGenPath) {
-    assert(!PGOUsePath && !PGOSampleUsePath);
-    unwrap(PMBR)->EnablePGOInstrGen = true;
-    unwrap(PMBR)->PGOInstrGen = PGOGenPath;
-  } else if (PGOUsePath) {
-    assert(!PGOSampleUsePath);
-    unwrap(PMBR)->PGOInstrUse = PGOUsePath;
-  } else if (PGOSampleUsePath) {
-    unwrap(PMBR)->PGOSampleUse = PGOSampleUsePath;
-  }
-#else
-  report_fatal_error("Legacy PM not supported with LLVM 15");
-#endif
-}
-
-// Unfortunately, the LLVM C API doesn't provide a way to set the `LibraryInfo`
-// field of a PassManagerBuilder, we expose our own method of doing so.
-extern "C" void LLVMRustAddBuilderLibraryInfo(LLVMPassManagerBuilderRef PMBR,
-                                              LLVMModuleRef M,
-                                              bool DisableSimplifyLibCalls) {
-  Triple TargetTriple(unwrap(M)->getTargetTriple());
-  TargetLibraryInfoImpl *TLI = new TargetLibraryInfoImpl(TargetTriple);
-  if (DisableSimplifyLibCalls)
-    TLI->disableAllFunctions();
-  unwrap(PMBR)->LibraryInfo = TLI;
-}
-
 // Unfortunately, the LLVM C API doesn't provide a way to create the
 // TargetLibraryInfo pass, so we use this method to do so.
 extern "C" void LLVMRustAddLibraryInfo(LLVMPassManagerRef PMR, LLVMModuleRef M,
@@ -648,30 +462,9 @@ extern "C" void LLVMRustAddLibraryInfo(LLVMPassManagerRef PMR, LLVMModuleRef M,
   unwrap(PMR)->add(new TargetLibraryInfoWrapperPass(TLII));
 }
 
-// Unfortunately, the LLVM C API doesn't provide an easy way of iterating over
-// all the functions in a module, so we do that manually here. You'll find
-// similar code in clang's BackendUtil.cpp file.
-extern "C" void LLVMRustRunFunctionPassManager(LLVMPassManagerRef PMR,
-                                               LLVMModuleRef M) {
-  llvm::legacy::FunctionPassManager *P =
-      unwrap<llvm::legacy::FunctionPassManager>(PMR);
-  P->doInitialization();
-
-  // Upgrade all calls to old intrinsics first.
-  for (Module::iterator I = unwrap(M)->begin(), E = unwrap(M)->end(); I != E;)
-    UpgradeCallsToIntrinsic(&*I++); // must be post-increment, as we remove
-
-  for (Module::iterator I = unwrap(M)->begin(), E = unwrap(M)->end(); I != E;
-       ++I)
-    if (!I->isDeclaration())
-      P->run(*I);
-
-  P->doFinalization();
-}
-
 extern "C" void LLVMRustSetLLVMOptions(int Argc, char **Argv) {
   // Initializing the command-line options more than once is not allowed. So,
-  // check if they've already been initialized.  (This could happen if we're
+  // check if they've already been initialized. (This could happen if we're
   // being called from rustpkg, for example). If the arguments change, then
   // that's just kinda unfortunate.
   static bool Initialized = false;
@@ -812,7 +605,7 @@ struct LLVMRustSanitizerOptions {
 };
 
 extern "C" LLVMRustResult
-LLVMRustOptimizeWithNewPassManager(
+LLVMRustOptimize(
     LLVMModuleRef ModuleRef,
     LLVMTargetMachineRef TMRef,
     LLVMRustPassBuilderOptLevel OptLevelRust,
@@ -846,28 +639,55 @@ LLVMRustOptimizeWithNewPassManager(
   bool DebugPassManager = false;
 
   PassInstrumentationCallbacks PIC;
+#if LLVM_VERSION_LT(16, 0)
   StandardInstrumentations SI(DebugPassManager);
+#else
+  StandardInstrumentations SI(TheModule->getContext(), DebugPassManager);
+#endif
   SI.registerCallbacks(PIC);
 
   if (LlvmSelfProfiler){
     LLVMSelfProfileInitializeCallbacks(PIC,LlvmSelfProfiler,BeforePassCallback,AfterPassCallback);
   }
 
+#if LLVM_VERSION_LT(16, 0)
   Optional<PGOOptions> PGOOpt;
+#else
+  std::optional<PGOOptions> PGOOpt;
+#endif
+#if LLVM_VERSION_GE(17, 0)
+  auto FS = vfs::getRealFileSystem();
+#endif
   if (PGOGenPath) {
     assert(!PGOUsePath && !PGOSampleUsePath);
-    PGOOpt = PGOOptions(PGOGenPath, "", "", PGOOptions::IRInstr,
-                        PGOOptions::NoCSAction, DebugInfoForProfiling);
+    PGOOpt = PGOOptions(PGOGenPath, "", "",
+#if LLVM_VERSION_GE(17, 0)
+                        FS,
+#endif
+                        PGOOptions::IRInstr, PGOOptions::NoCSAction,
+                        DebugInfoForProfiling);
   } else if (PGOUsePath) {
     assert(!PGOSampleUsePath);
-    PGOOpt = PGOOptions(PGOUsePath, "", "", PGOOptions::IRUse,
-                        PGOOptions::NoCSAction, DebugInfoForProfiling);
+    PGOOpt = PGOOptions(PGOUsePath, "", "",
+#if LLVM_VERSION_GE(17, 0)
+                        FS,
+#endif
+                        PGOOptions::IRUse, PGOOptions::NoCSAction,
+                        DebugInfoForProfiling);
   } else if (PGOSampleUsePath) {
-    PGOOpt = PGOOptions(PGOSampleUsePath, "", "", PGOOptions::SampleUse,
-                        PGOOptions::NoCSAction, DebugInfoForProfiling);
+    PGOOpt = PGOOptions(PGOSampleUsePath, "", "",
+#if LLVM_VERSION_GE(17, 0)
+                        FS,
+#endif
+                        PGOOptions::SampleUse, PGOOptions::NoCSAction,
+                        DebugInfoForProfiling);
   } else if (DebugInfoForProfiling) {
-    PGOOpt = PGOOptions("", "", "", PGOOptions::NoAction,
-                        PGOOptions::NoCSAction, DebugInfoForProfiling);
+    PGOOpt = PGOOptions("", "", "",
+#if LLVM_VERSION_GE(17, 0)
+                        FS,
+#endif
+                        PGOOptions::NoAction, PGOOptions::NoCSAction,
+                        DebugInfoForProfiling);
   }
 
   PassBuilder PB(TM, PTO, PGOOpt, &PIC);
@@ -927,18 +747,28 @@ LLVMRustOptimizeWithNewPassManager(
 
   if (SanitizerOptions) {
     if (SanitizerOptions->SanitizeMemory) {
+#if LLVM_VERSION_GE(14, 0)
+      MemorySanitizerOptions Options(
+          SanitizerOptions->SanitizeMemoryTrackOrigins,
+          SanitizerOptions->SanitizeMemoryRecover,
+          /*CompileKernel=*/false,
+          /*EagerChecks=*/true);
+#else
       MemorySanitizerOptions Options(
           SanitizerOptions->SanitizeMemoryTrackOrigins,
           SanitizerOptions->SanitizeMemoryRecover,
           /*CompileKernel=*/false);
+#endif
       OptimizerLastEPCallbacks.push_back(
         [Options](ModulePassManager &MPM, OptimizationLevel Level) {
-#if LLVM_VERSION_GE(14, 0)
+#if LLVM_VERSION_GE(14, 0) && LLVM_VERSION_LT(16, 0)
           MPM.addPass(ModuleMemorySanitizerPass(Options));
 #else
           MPM.addPass(MemorySanitizerPass(Options));
 #endif
+#if LLVM_VERSION_LT(16, 0)
           MPM.addPass(createModuleToFunctionPassAdaptor(MemorySanitizerPass(Options)));
+#endif
         }
       );
     }
@@ -969,7 +799,11 @@ LLVMRustOptimizeWithNewPassManager(
             /*UseAfterScope=*/true,
             AsanDetectStackUseAfterReturnMode::Runtime,
           };
+#if LLVM_VERSION_LT(16, 0)
           MPM.addPass(ModuleAddressSanitizerPass(opts));
+#else
+          MPM.addPass(AddressSanitizerPass(opts));
+#endif
 #else
           MPM.addPass(ModuleAddressSanitizerPass(
               /*CompileKernel=*/false, SanitizerOptions->SanitizeAddressRecover));
@@ -1005,7 +839,7 @@ LLVMRustOptimizeWithNewPassManager(
       auto Plugin = PassPlugin::Load(PluginPath.str());
       if (!Plugin) {
         LLVMRustSetLastError(("Failed to load pass plugin" + PluginPath.str()).c_str());
-        continue;
+        return LLVMRustResult::Failure;
       }
       Plugin->registerPassBuilderCallbacks(PB);
     }
@@ -1219,15 +1053,8 @@ extern "C" void LLVMRustPrintPasses() {
   PR->enumerateWith(&Listener);
 }
 
-extern "C" void LLVMRustAddAlwaysInlinePass(LLVMPassManagerBuilderRef PMBR,
-                                            bool AddLifetimes) {
-  unwrap(PMBR)->Inliner = llvm::createAlwaysInlinerLegacyPass(AddLifetimes);
-}
-
 extern "C" void LLVMRustRunRestrictionPass(LLVMModuleRef M, char **Symbols,
                                            size_t Len) {
-  llvm::legacy::PassManager passes;
-
   auto PreserveFunctions = [=](const GlobalValue &GV) {
     for (size_t I = 0; I < Len; I++) {
       if (GV.getName() == Symbols[I]) {
@@ -1237,9 +1064,7 @@ extern "C" void LLVMRustRunRestrictionPass(LLVMModuleRef M, char **Symbols,
     return false;
   };
 
-  passes.add(llvm::createInternalizePass(PreserveFunctions));
-
-  passes.run(*unwrap(M));
+  internalizeModule(*unwrap(M), PreserveFunctions);
 }
 
 extern "C" void
@@ -1260,7 +1085,7 @@ extern "C" void LLVMRustSetModulePIELevel(LLVMModuleRef M) {
 extern "C" void LLVMRustSetModuleCodeModel(LLVMModuleRef M,
                                            LLVMRustCodeModel Model) {
   auto CM = fromRust(Model);
-  if (!CM.hasValue())
+  if (!CM)
     return;
   unwrap(M)->setCodeModel(*CM);
 }
@@ -1587,13 +1412,23 @@ LLVMRustThinLTOBufferCreate(LLVMModuleRef M, bool is_thin) {
   {
     raw_string_ostream OS(Ret->data);
     {
-      legacy::PassManager PM;
       if (is_thin) {
-        PM.add(createWriteThinLTOBitcodePass(OS));
+        PassBuilder PB;
+        LoopAnalysisManager LAM;
+        FunctionAnalysisManager FAM;
+        CGSCCAnalysisManager CGAM;
+        ModuleAnalysisManager MAM;
+        PB.registerModuleAnalyses(MAM);
+        PB.registerCGSCCAnalyses(CGAM);
+        PB.registerFunctionAnalyses(FAM);
+        PB.registerLoopAnalyses(LAM);
+        PB.crossRegisterProxies(LAM, FAM, CGAM, MAM);
+        ModulePassManager MPM;
+        MPM.addPass(ThinLTOBitcodeWriterPass(OS, nullptr));
+        MPM.run(*unwrap(M), MAM);
       } else {
-        PM.add(createBitcodeWriterPass(OS));
+        WriteBitcodeToFile(*unwrap(M), OS);
       }
-      PM.run(*unwrap(M));
     }
   }
   return Ret.release();
@@ -1615,7 +1450,7 @@ LLVMRustThinLTOBufferLen(const LLVMRustThinLTOBuffer *Buffer) {
 }
 
 // This is what we used to parse upstream bitcode for actual ThinLTO
-// processing.  We'll call this once per module optimized through ThinLTO, and
+// processing. We'll call this once per module optimized through ThinLTO, and
 // it'll be called concurrently on many threads.
 extern "C" LLVMModuleRef
 LLVMRustParseBitcodeForLTO(LLVMContextRef Context,

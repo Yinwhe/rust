@@ -1,5 +1,6 @@
-use std::convert::{TryFrom, TryInto};
 use std::fmt;
+
+use either::{Either, Left, Right};
 
 use rustc_apfloat::{
     ieee::{Double, Single},
@@ -8,7 +9,7 @@ use rustc_apfloat::{
 use rustc_macros::HashStable;
 use rustc_target::abi::{HasDataLayout, Size};
 
-use crate::ty::{Lift, ParamEnv, ScalarInt, Ty, TyCtxt};
+use crate::ty::{ParamEnv, ScalarInt, Ty, TyCtxt};
 
 use super::{
     AllocId, AllocRange, ConstAllocation, InterpResult, Pointer, PointerArithmetic, Provenance,
@@ -18,16 +19,16 @@ use super::{
 /// Represents the result of const evaluation via the `eval_to_allocation` query.
 #[derive(Copy, Clone, HashStable, TyEncodable, TyDecodable, Debug, Hash, Eq, PartialEq)]
 pub struct ConstAlloc<'tcx> {
-    // the value lives here, at offset 0, and that allocation definitely is an `AllocKind::Memory`
-    // (so you can use `AllocMap::unwrap_memory`).
+    /// The value lives here, at offset 0, and that allocation definitely is an `AllocKind::Memory`
+    /// (so you can use `AllocMap::unwrap_memory`).
     pub alloc_id: AllocId,
     pub ty: Ty<'tcx>,
 }
 
 /// Represents a constant value in Rust. `Scalar` and `Slice` are optimizations for
 /// array length computations, enum discriminants and the pattern matching logic.
-#[derive(Copy, Clone, Debug, Eq, PartialEq, PartialOrd, Ord, TyEncodable, TyDecodable, Hash)]
-#[derive(HashStable)]
+#[derive(Copy, Clone, Debug, Eq, PartialEq, TyEncodable, TyDecodable, Hash)]
+#[derive(HashStable, Lift)]
 pub enum ConstValue<'tcx> {
     /// Used only for types with `layout::abi::Scalar` ABI.
     ///
@@ -52,22 +53,6 @@ pub enum ConstValue<'tcx> {
 
 #[cfg(all(target_arch = "x86_64", target_pointer_width = "64"))]
 static_assert_size!(ConstValue<'_>, 32);
-
-impl<'a, 'tcx> Lift<'tcx> for ConstValue<'a> {
-    type Lifted = ConstValue<'tcx>;
-    fn lift_to_tcx(self, tcx: TyCtxt<'tcx>) -> Option<ConstValue<'tcx>> {
-        Some(match self {
-            ConstValue::Scalar(s) => ConstValue::Scalar(s),
-            ConstValue::ZeroSized => ConstValue::ZeroSized,
-            ConstValue::Slice { data, start, end } => {
-                ConstValue::Slice { data: tcx.lift(data)?, start, end }
-            }
-            ConstValue::ByRef { alloc, offset } => {
-                ConstValue::ByRef { alloc: tcx.lift(alloc)?, offset }
-            }
-        })
-    }
-}
 
 impl<'tcx> ConstValue<'tcx> {
     #[inline]
@@ -124,15 +109,13 @@ impl<'tcx> ConstValue<'tcx> {
 ///
 /// These variants would be private if there was a convenient way to achieve that in Rust.
 /// Do *not* match on a `Scalar`! Use the various `to_*` methods instead.
-#[derive(Clone, Copy, Eq, PartialEq, Ord, PartialOrd, TyEncodable, TyDecodable, Hash)]
+#[derive(Clone, Copy, Eq, PartialEq, TyEncodable, TyDecodable, Hash)]
 #[derive(HashStable)]
 pub enum Scalar<Prov = AllocId> {
     /// The raw bytes of a simple value.
     Int(ScalarInt),
 
-    /// A pointer into an `Allocation`. An `Allocation` in the `memory` module has a list of
-    /// relocations, but a `Scalar` is only large enough to contain one, so we just represent the
-    /// relocation and its associated offset together as a `Pointer` here.
+    /// A pointer.
     ///
     /// We also store the size of the pointer, such that a `Scalar` always knows how big it is.
     /// The size is always the pointer size of the current target, but this is not information
@@ -311,10 +294,10 @@ impl<Prov> Scalar<Prov> {
     pub fn to_bits_or_ptr_internal(
         self,
         target_size: Size,
-    ) -> Result<Result<u128, Pointer<Prov>>, ScalarSizeMismatch> {
+    ) -> Result<Either<u128, Pointer<Prov>>, ScalarSizeMismatch> {
         assert_ne!(target_size.bytes(), 0, "you should never look at the bits of a ZST");
         Ok(match self {
-            Scalar::Int(int) => Ok(int.to_bits(target_size).map_err(|size| {
+            Scalar::Int(int) => Left(int.to_bits(target_size).map_err(|size| {
                 ScalarSizeMismatch { target_size: target_size.bytes(), data_size: size.bytes() }
             })?),
             Scalar::Ptr(ptr, sz) => {
@@ -324,7 +307,7 @@ impl<Prov> Scalar<Prov> {
                         data_size: sz.into(),
                     });
                 }
-                Err(ptr)
+                Right(ptr)
             }
         })
     }
@@ -336,8 +319,8 @@ impl<'tcx, Prov: Provenance> Scalar<Prov> {
             .to_bits_or_ptr_internal(cx.pointer_size())
             .map_err(|s| err_ub!(ScalarSizeMismatch(s)))?
         {
-            Err(ptr) => Ok(ptr.into()),
-            Ok(bits) => {
+            Right(ptr) => Ok(ptr.into()),
+            Left(bits) => {
                 let addr = u64::try_from(bits).unwrap();
                 Ok(Pointer::from_addr(addr))
             }
@@ -504,145 +487,12 @@ impl<'tcx, Prov: Provenance> Scalar<Prov> {
     }
 }
 
-#[derive(Clone, Copy, Eq, PartialEq, TyEncodable, TyDecodable, HashStable, Hash)]
-pub enum ScalarMaybeUninit<Prov = AllocId> {
-    Scalar(Scalar<Prov>),
-    Uninit,
-}
-
-#[cfg(all(target_arch = "x86_64", target_pointer_width = "64"))]
-static_assert_size!(ScalarMaybeUninit, 24);
-
-impl<Prov> From<Scalar<Prov>> for ScalarMaybeUninit<Prov> {
-    #[inline(always)]
-    fn from(s: Scalar<Prov>) -> Self {
-        ScalarMaybeUninit::Scalar(s)
-    }
-}
-
-// We want the `Debug` output to be readable as it is used by `derive(Debug)` for
-// all the Miri types.
-impl<Prov: Provenance> fmt::Debug for ScalarMaybeUninit<Prov> {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            ScalarMaybeUninit::Uninit => write!(f, "<uninitialized>"),
-            ScalarMaybeUninit::Scalar(s) => write!(f, "{:?}", s),
-        }
-    }
-}
-
-impl<Prov: Provenance> fmt::LowerHex for ScalarMaybeUninit<Prov> {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            ScalarMaybeUninit::Uninit => write!(f, "uninitialized bytes"),
-            ScalarMaybeUninit::Scalar(s) => write!(f, "{:x}", s),
-        }
-    }
-}
-
-impl<Prov> ScalarMaybeUninit<Prov> {
-    #[inline]
-    pub fn from_pointer(ptr: Pointer<Prov>, cx: &impl HasDataLayout) -> Self {
-        ScalarMaybeUninit::Scalar(Scalar::from_pointer(ptr, cx))
-    }
-
-    #[inline]
-    pub fn from_maybe_pointer(ptr: Pointer<Option<Prov>>, cx: &impl HasDataLayout) -> Self {
-        ScalarMaybeUninit::Scalar(Scalar::from_maybe_pointer(ptr, cx))
-    }
-
-    #[inline]
-    pub fn check_init<'tcx>(self) -> InterpResult<'tcx, Scalar<Prov>> {
-        match self {
-            ScalarMaybeUninit::Scalar(scalar) => Ok(scalar),
-            ScalarMaybeUninit::Uninit => throw_ub!(InvalidUninitBytes(None)),
-        }
-    }
-}
-
-impl<'tcx, Prov: Provenance> ScalarMaybeUninit<Prov> {
-    #[inline(always)]
-    pub fn to_pointer(self, cx: &impl HasDataLayout) -> InterpResult<'tcx, Pointer<Option<Prov>>> {
-        self.check_init()?.to_pointer(cx)
-    }
-
-    #[inline(always)]
-    pub fn to_bool(self) -> InterpResult<'tcx, bool> {
-        self.check_init()?.to_bool()
-    }
-
-    #[inline(always)]
-    pub fn to_char(self) -> InterpResult<'tcx, char> {
-        self.check_init()?.to_char()
-    }
-
-    #[inline(always)]
-    pub fn to_f32(self) -> InterpResult<'tcx, Single> {
-        self.check_init()?.to_f32()
-    }
-
-    #[inline(always)]
-    pub fn to_f64(self) -> InterpResult<'tcx, Double> {
-        self.check_init()?.to_f64()
-    }
-
-    #[inline(always)]
-    pub fn to_u8(self) -> InterpResult<'tcx, u8> {
-        self.check_init()?.to_u8()
-    }
-
-    #[inline(always)]
-    pub fn to_u16(self) -> InterpResult<'tcx, u16> {
-        self.check_init()?.to_u16()
-    }
-
-    #[inline(always)]
-    pub fn to_u32(self) -> InterpResult<'tcx, u32> {
-        self.check_init()?.to_u32()
-    }
-
-    #[inline(always)]
-    pub fn to_u64(self) -> InterpResult<'tcx, u64> {
-        self.check_init()?.to_u64()
-    }
-
-    #[inline(always)]
-    pub fn to_machine_usize(self, cx: &impl HasDataLayout) -> InterpResult<'tcx, u64> {
-        self.check_init()?.to_machine_usize(cx)
-    }
-
-    #[inline(always)]
-    pub fn to_i8(self) -> InterpResult<'tcx, i8> {
-        self.check_init()?.to_i8()
-    }
-
-    #[inline(always)]
-    pub fn to_i16(self) -> InterpResult<'tcx, i16> {
-        self.check_init()?.to_i16()
-    }
-
-    #[inline(always)]
-    pub fn to_i32(self) -> InterpResult<'tcx, i32> {
-        self.check_init()?.to_i32()
-    }
-
-    #[inline(always)]
-    pub fn to_i64(self) -> InterpResult<'tcx, i64> {
-        self.check_init()?.to_i64()
-    }
-
-    #[inline(always)]
-    pub fn to_machine_isize(self, cx: &impl HasDataLayout) -> InterpResult<'tcx, i64> {
-        self.check_init()?.to_machine_isize(cx)
-    }
-}
-
 /// Gets the bytes of a constant slice value.
 pub fn get_slice_bytes<'tcx>(cx: &impl HasDataLayout, val: ConstValue<'tcx>) -> &'tcx [u8] {
     if let ConstValue::Slice { data, start, end } = val {
         let len = end - start;
         data.inner()
-            .get_bytes(
+            .get_bytes_strip_provenance(
                 cx,
                 AllocRange { start: Size::from_bytes(start), size: Size::from_bytes(len) },
             )

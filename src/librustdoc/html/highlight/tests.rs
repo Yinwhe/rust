@@ -9,7 +9,7 @@ const STYLE: &str = r#"
 .kw { color: #8959A8; }
 .kw-2, .prelude-ty { color: #4271AE; }
 .number, .string { color: #718C00; }
-.self, .bool-val, .prelude-val, .attribute, .attribute .ident { color: #C82829; }
+.self, .bool-val, .prelude-val, .attr, .attr .ident { color: #C82829; }
 .macro, .macro-nonterminal { color: #3E999F; }
 .lifetime { color: #B76514; }
 .question-mark { color: #ff9011; }
@@ -69,9 +69,12 @@ fn test_union_highlighting() {
 fn test_decorations() {
     create_default_session_globals_then(|| {
         let src = "let x = 1;
-let y = 2;";
+let y = 2;
+let z = 3;
+let a = 4;";
         let mut decorations = FxHashMap::default();
-        decorations.insert("example", vec![(0, 10)]);
+        decorations.insert("example", vec![(0, 10), (11, 21)]);
+        decorations.insert("example2", vec![(22, 32)]);
 
         let mut html = Buffer::new();
         write_code(&mut html, src, None, Some(DecorationInfo(decorations)));

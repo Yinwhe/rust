@@ -7,6 +7,7 @@ use lsp_types::{
     notification::Notification, CodeActionKind, DocumentOnTypeFormattingParams,
     PartialResultParams, Position, Range, TextDocumentIdentifier, WorkDoneProgressParams,
 };
+use lsp_types::{PositionEncodingKind, VersionedTextDocumentIdentifier};
 use serde::{Deserialize, Serialize};
 
 pub enum AnalyzerStatus {}
@@ -127,6 +128,33 @@ pub struct ExpandMacroParams {
 pub struct ExpandedMacro {
     pub name: String,
     pub expansion: String,
+}
+
+pub enum CancelFlycheck {}
+
+impl Notification for CancelFlycheck {
+    type Params = ();
+    const METHOD: &'static str = "rust-analyzer/cancelFlycheck";
+}
+
+pub enum RunFlycheck {}
+
+impl Notification for RunFlycheck {
+    type Params = RunFlycheckParams;
+    const METHOD: &'static str = "rust-analyzer/runFlycheck";
+}
+
+pub enum ClearFlycheck {}
+
+impl Notification for ClearFlycheck {
+    type Params = ();
+    const METHOD: &'static str = "rust-analyzer/clearFlycheck";
+}
+
+#[derive(Deserialize, Serialize, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct RunFlycheckParams {
+    pub text_document: Option<TextDocumentIdentifier>,
 }
 
 pub enum MatchingBrace {}
@@ -447,7 +475,15 @@ pub(crate) enum CodeLensResolveData {
 }
 
 pub fn supports_utf8(caps: &lsp_types::ClientCapabilities) -> bool {
-    caps.offset_encoding.as_deref().unwrap_or_default().iter().any(|it| it == "utf-8")
+    match &caps.general {
+        Some(general) => general
+            .position_encodings
+            .as_deref()
+            .unwrap_or_default()
+            .iter()
+            .any(|it| it == &PositionEncodingKind::UTF8),
+        _ => false,
+    }
 }
 
 pub enum MoveItem {}
@@ -533,7 +569,7 @@ pub struct CompletionResolveData {
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct InlayHintResolveData {
-    pub text_document: TextDocumentIdentifier,
+    pub text_document: VersionedTextDocumentIdentifier,
     pub position: PositionOrRange,
 }
 

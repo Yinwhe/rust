@@ -37,7 +37,7 @@ use rustc_data_structures::graph::WithSuccessors;
 use rustc_index::vec::{Idx, IndexVec};
 use rustc_middle::mir::coverage::CoverageKind;
 use rustc_middle::mir::*;
-use rustc_middle::ty::{self, Ty, TyCtxt};
+use rustc_middle::ty;
 use rustc_span::{self, BytePos, Pos, Span, DUMMY_SP};
 
 // All `TEMP_BLOCK` targets should be replaced before calling `to_body() -> mir::Body`.
@@ -47,7 +47,6 @@ struct MockBlocks<'tcx> {
     blocks: IndexVec<BasicBlock, BasicBlockData<'tcx>>,
     dummy_place: Place<'tcx>,
     next_local: usize,
-    bool_ty: Ty<'tcx>,
 }
 
 impl<'tcx> MockBlocks<'tcx> {
@@ -56,7 +55,6 @@ impl<'tcx> MockBlocks<'tcx> {
             blocks: IndexVec::new(),
             dummy_place: Place { local: RETURN_PLACE, projection: ty::List::empty() },
             next_local: 0,
-            bool_ty: TyCtxt::BOOL_TY_FOR_UNIT_TESTING,
         }
     }
 
@@ -157,7 +155,6 @@ impl<'tcx> MockBlocks<'tcx> {
     fn switchint(&mut self, some_from_block: Option<BasicBlock>) -> BasicBlock {
         let switchint_kind = TerminatorKind::SwitchInt {
             discr: Operand::Move(Place::from(self.new_temp())),
-            switch_ty: self.bool_ty, // just a dummy value
             targets: SwitchTargets::static_if(0, TEMP_BLOCK, TEMP_BLOCK),
         };
         self.add_block_from(some_from_block, switchint_kind)
@@ -172,11 +169,11 @@ impl<'tcx> MockBlocks<'tcx> {
     }
 }
 
-fn debug_basic_blocks<'tcx>(mir_body: &Body<'tcx>) -> String {
+fn debug_basic_blocks(mir_body: &Body<'_>) -> String {
     format!(
         "{:?}",
         mir_body
-            .basic_blocks()
+            .basic_blocks
             .iter_enumerated()
             .map(|(bb, data)| {
                 let term = &data.terminator();
@@ -213,7 +210,7 @@ fn print_mir_graphviz(name: &str, mir_body: &Body<'_>) {
             "digraph {} {{\n{}\n}}",
             name,
             mir_body
-                .basic_blocks()
+                .basic_blocks
                 .iter_enumerated()
                 .map(|(bb, data)| {
                     format!(
@@ -653,7 +650,7 @@ fn test_traverse_coverage_with_loops() {
 
 fn synthesize_body_span_from_terminators(mir_body: &Body<'_>) -> Span {
     let mut some_span: Option<Span> = None;
-    for (_, data) in mir_body.basic_blocks().iter_enumerated() {
+    for (_, data) in mir_body.basic_blocks.iter_enumerated() {
         let term_span = data.terminator().source_info.span;
         if let Some(span) = some_span.as_mut() {
             *span = span.to(term_span);

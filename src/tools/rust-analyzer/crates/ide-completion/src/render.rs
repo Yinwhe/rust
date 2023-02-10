@@ -131,7 +131,7 @@ pub(crate) fn render_field(
     item.detail(ty.display(ctx.db()).to_string())
         .set_documentation(field.docs(ctx.db()))
         .set_deprecated(is_deprecated)
-        .lookup_by(name.clone());
+        .lookup_by(name);
     item.insert_text(field_with_receiver(receiver.as_ref(), &escaped_name));
     if let Some(receiver) = &dot_access.receiver {
         if let Some(original) = ctx.completion.sema.original_ast_node(receiver.clone()) {
@@ -144,8 +144,7 @@ pub(crate) fn render_field(
 }
 
 fn field_with_receiver(receiver: Option<&hir::Name>, field_name: &str) -> SmolStr {
-    receiver
-        .map_or_else(|| field_name.into(), |receiver| format!("{}.{}", receiver, field_name).into())
+    receiver.map_or_else(|| field_name.into(), |receiver| format!("{receiver}.{field_name}").into())
 }
 
 pub(crate) fn render_tuple_field(
@@ -306,7 +305,7 @@ fn render_resolution_path(
                 item.lookup_by(name.clone())
                     .label(SmolStr::from_iter([&name, "<…>"]))
                     .trigger_call_info()
-                    .insert_snippet(cap, format!("{}<$0>", local_name));
+                    .insert_snippet(cap, format!("{local_name}<$0>"));
             }
         }
     }
@@ -323,9 +322,7 @@ fn render_resolution_path(
             ..CompletionRelevance::default()
         });
 
-        if let Some(ref_match) = compute_ref_match(completion, &ty) {
-            item.ref_match(ref_match, path_ctx.path.syntax().text_range().start());
-        }
+        path_ref_match(completion, path_ctx, &ty, &mut item);
     };
     item
 }
@@ -453,6 +450,29 @@ fn compute_ref_match(
     None
 }
 
+fn path_ref_match(
+    completion: &CompletionContext<'_>,
+    path_ctx: &PathCompletionCtx,
+    ty: &hir::Type,
+    item: &mut Builder,
+) {
+    if let Some(original_path) = &path_ctx.original_path {
+        // At least one char was typed by the user already, in that case look for the original path
+        if let Some(original_path) = completion.sema.original_ast_node(original_path.clone()) {
+            if let Some(ref_match) = compute_ref_match(completion, ty) {
+                item.ref_match(ref_match, original_path.syntax().text_range().start());
+            }
+        }
+    } else {
+        // completion requested on an empty identifier, there is no path here yet.
+        // FIXME: This might create inconsistent completions where we show a ref match in macro inputs
+        // as long as nothing was typed yet
+        if let Some(ref_match) = compute_ref_match(completion, ty) {
+            item.ref_match(ref_match, completion.position.offset);
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::cmp;
@@ -507,13 +527,13 @@ mod tests {
 
                 let tag = it.kind().tag();
                 let relevance = display_relevance(it.relevance());
-                items.push(format!("{} {} {}\n", tag, it.label(), relevance));
+                items.push(format!("{tag} {} {relevance}\n", it.label()));
 
                 if let Some((mutability, _offset, relevance)) = it.ref_match() {
                     let label = format!("&{}{}", mutability.as_keyword_for_ref(), it.label());
                     let relevance = display_relevance(relevance);
 
-                    items.push(format!("{} {} {}\n", tag, label, relevance));
+                    items.push(format!("{tag} {label} {relevance}\n"));
                 }
 
                 items
@@ -542,7 +562,7 @@ mod tests {
             .filter_map(|(cond, desc)| if cond { Some(desc) } else { None })
             .join("+");
 
-            format!("[{}]", relevance_factors)
+            format!("[{relevance_factors}]")
         }
     }
 
@@ -565,6 +585,7 @@ fn main() { Foo::Fo$0 }
                         kind: SymbolKind(
                             Variant,
                         ),
+                        lookup: "Foo{}",
                         detail: "Foo { x: i32, y: i32 }",
                     },
                 ]
@@ -591,6 +612,7 @@ fn main() { Foo::Fo$0 }
                         kind: SymbolKind(
                             Variant,
                         ),
+                        lookup: "Foo()",
                         detail: "Foo(i32, i32)",
                     },
                 ]
@@ -707,7 +729,7 @@ fn main() { let _: m::Spam = S$0 }
                         kind: SymbolKind(
                             Variant,
                         ),
-                        lookup: "Spam::Bar(…)",
+                        lookup: "Spam::Bar()",
                         detail: "m::Spam::Bar(i32)",
                         relevance: CompletionRelevance {
                             exact_name_match: false,

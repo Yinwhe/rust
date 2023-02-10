@@ -5,32 +5,28 @@
 //! The providers for the queries defined here can be found in
 //! `rustc_traits`.
 
+use crate::error::DropCheckOverflow;
 use crate::infer::canonical::{Canonical, QueryResponse};
 use crate::ty::error::TypeError;
 use crate::ty::subst::GenericArg;
 use crate::ty::{self, Ty, TyCtxt};
-use rustc_errors::struct_span_err;
 use rustc_span::source_map::Span;
-use std::iter::FromIterator;
 
 pub mod type_op {
     use crate::ty::fold::TypeFoldable;
-    use crate::ty::subst::UserSubsts;
-    use crate::ty::{Predicate, Ty};
-    use rustc_hir::def_id::DefId;
+    use crate::ty::{Predicate, Ty, UserType};
     use std::fmt;
 
     #[derive(Copy, Clone, Debug, Hash, PartialEq, Eq, HashStable, Lift)]
     #[derive(TypeFoldable, TypeVisitable)]
     pub struct AscribeUserType<'tcx> {
         pub mir_ty: Ty<'tcx>,
-        pub def_id: DefId,
-        pub user_substs: UserSubsts<'tcx>,
+        pub user_ty: UserType<'tcx>,
     }
 
     impl<'tcx> AscribeUserType<'tcx> {
-        pub fn new(mir_ty: Ty<'tcx>, def_id: DefId, user_substs: UserSubsts<'tcx>) -> Self {
-            Self { mir_ty, def_id, user_substs }
+        pub fn new(mir_ty: Ty<'tcx>, user_ty: UserType<'tcx>) -> Self {
+            Self { mir_ty, user_ty }
         }
     }
 
@@ -76,8 +72,7 @@ pub mod type_op {
     }
 }
 
-pub type CanonicalProjectionGoal<'tcx> =
-    Canonical<'tcx, ty::ParamEnvAnd<'tcx, ty::ProjectionTy<'tcx>>>;
+pub type CanonicalProjectionGoal<'tcx> = Canonical<'tcx, ty::ParamEnvAnd<'tcx, ty::AliasTy<'tcx>>>;
 
 pub type CanonicalTyGoal<'tcx> = Canonical<'tcx, ty::ParamEnvAnd<'tcx, Ty<'tcx>>>;
 
@@ -97,7 +92,7 @@ pub type CanonicalTypeOpProvePredicateGoal<'tcx> =
 pub type CanonicalTypeOpNormalizeGoal<'tcx, T> =
     Canonical<'tcx, ty::ParamEnvAnd<'tcx, type_op::Normalize<T>>>;
 
-#[derive(Copy, Clone, Debug, HashStable)]
+#[derive(Copy, Clone, Debug, HashStable, PartialEq, Eq)]
 pub struct NoSolution;
 
 pub type Fallible<T> = Result<T, NoSolution>;
@@ -117,15 +112,7 @@ pub struct DropckOutlivesResult<'tcx> {
 impl<'tcx> DropckOutlivesResult<'tcx> {
     pub fn report_overflows(&self, tcx: TyCtxt<'tcx>, span: Span, ty: Ty<'tcx>) {
         if let Some(overflow_ty) = self.overflows.get(0) {
-            let mut err = struct_span_err!(
-                tcx.sess,
-                span,
-                E0320,
-                "overflow while adding drop-check rules for {}",
-                ty,
-            );
-            err.note(&format!("overflowed on {}", overflow_ty));
-            err.emit();
+            tcx.sess.emit_err(DropCheckOverflow { span, ty, overflow_ty: *overflow_ty });
         }
     }
 
@@ -226,5 +213,5 @@ pub struct NormalizationResult<'tcx> {
 pub enum OutlivesBound<'tcx> {
     RegionSubRegion(ty::Region<'tcx>, ty::Region<'tcx>),
     RegionSubParam(ty::Region<'tcx>, ty::ParamTy),
-    RegionSubProjection(ty::Region<'tcx>, ty::ProjectionTy<'tcx>),
+    RegionSubAlias(ty::Region<'tcx>, ty::AliasTy<'tcx>),
 }

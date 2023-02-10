@@ -3,6 +3,7 @@ use rustc_hir as hir;
 use rustc_hir::lang_items::LangItem;
 use rustc_middle::ty::{self, Region, RegionVid, TypeFoldable, TypeSuperFoldable};
 use rustc_trait_selection::traits::auto_trait::{self, AutoTraitResult};
+use thin_vec::ThinVec;
 
 use std::fmt::Debug;
 
@@ -43,7 +44,7 @@ where
         discard_positive_impl: bool,
     ) -> Option<Item> {
         let tcx = self.cx.tcx;
-        let trait_ref = ty::TraitRef { def_id: trait_def_id, substs: tcx.mk_substs_trait(ty, &[]) };
+        let trait_ref = ty::Binder::dummy(tcx.mk_trait_ref(trait_def_id, [ty]));
         if !self.cx.generated_synthetics.insert((ty, trait_def_id)) {
             debug!("get_auto_trait_impl_for({:?}): already generated, aborting", trait_ref);
             return None;
@@ -110,7 +111,7 @@ where
                 );
                 let params = raw_generics.params;
 
-                Generics { params, where_predicates: Vec::new() }
+                Generics { params, where_predicates: ThinVec::new() }
             }
             AutoTraitResult::ExplicitImpl => return None,
         };
@@ -118,18 +119,18 @@ where
         Some(Item {
             name: None,
             attrs: Default::default(),
-            visibility: Inherited,
             item_id: ItemId::Auto { trait_: trait_def_id, for_: item_def_id },
             kind: Box::new(ImplItem(Box::new(Impl {
                 unsafety: hir::Unsafety::Normal,
                 generics: new_generics,
-                trait_: Some(clean_trait_ref_with_bindings(self.cx, trait_ref, &[])),
-                for_: clean_middle_ty(ty, self.cx, None),
+                trait_: Some(clean_trait_ref_with_bindings(self.cx, trait_ref, ThinVec::new())),
+                for_: clean_middle_ty(ty::Binder::dummy(ty), self.cx, None),
                 items: Vec::new(),
                 polarity,
                 kind: ImplKind::Auto,
             }))),
             cfg: None,
+            inline_stmt_id: None,
         })
     }
 
@@ -148,7 +149,7 @@ where
             })
             .collect();
         // We are only interested in case the type *doesn't* implement the Sized trait.
-        if !ty.is_sized(tcx.at(rustc_span::DUMMY_SP), param_env) {
+        if !ty.is_sized(tcx, param_env) {
             // In case `#![no_core]` is used, `sized_trait` returns nothing.
             if let Some(item) = tcx.lang_items().sized_trait().and_then(|sized_trait_did| {
                 self.generate_for_trait(ty, sized_trait_did, param_env, item_def_id, &f, true)
@@ -183,7 +184,7 @@ where
     fn handle_lifetimes<'cx>(
         regions: &RegionConstraintData<'cx>,
         names_map: &FxHashMap<Symbol, Lifetime>,
-    ) -> Vec<WherePredicate> {
+    ) -> ThinVec<WherePredicate> {
         // Our goal is to 'flatten' the list of constraints by eliminating
         // all intermediate RegionVids. At the end, all constraints should
         // be between Regions (aka region variables). This gives us the information
@@ -320,10 +321,10 @@ where
         let bound_predicate = pred.kind();
         let tcx = self.cx.tcx;
         let regions = match bound_predicate.skip_binder() {
-            ty::PredicateKind::Trait(poly_trait_pred) => {
+            ty::PredicateKind::Clause(ty::Clause::Trait(poly_trait_pred)) => {
                 tcx.collect_referenced_late_bound_regions(&bound_predicate.rebind(poly_trait_pred))
             }
-            ty::PredicateKind::Projection(poly_proj_pred) => {
+            ty::PredicateKind::Clause(ty::Clause::Projection(poly_proj_pred)) => {
                 tcx.collect_referenced_late_bound_regions(&bound_predicate.rebind(poly_proj_pred))
             }
             _ => return FxHashSet::default(),
@@ -335,10 +336,7 @@ where
                 match br {
                     // We only care about named late bound regions, as we need to add them
                     // to the 'for<>' section
-                    ty::BrNamed(_, name) => Some(GenericParamDef {
-                        name,
-                        kind: GenericParamDefKind::Lifetime { outlives: vec![] },
-                    }),
+                    ty::BrNamed(_, name) => Some(GenericParamDef::lifetime(name)),
                     _ => None,
                 }
             })
@@ -404,15 +402,13 @@ where
                     bound_params: Vec::new(),
                 })
             })
-            .chain(
-                lifetime_to_bounds.into_iter().filter(|&(_, ref bounds)| !bounds.is_empty()).map(
-                    |(lifetime, bounds)| {
-                        let mut bounds_vec = bounds.into_iter().collect();
-                        self.sort_where_bounds(&mut bounds_vec);
-                        WherePredicate::RegionPredicate { lifetime, bounds: bounds_vec }
-                    },
-                ),
-            )
+            .chain(lifetime_to_bounds.into_iter().filter(|(_, bounds)| !bounds.is_empty()).map(
+                |(lifetime, bounds)| {
+                    let mut bounds_vec = bounds.into_iter().collect();
+                    self.sort_where_bounds(&mut bounds_vec);
+                    WherePredicate::RegionPredicate { lifetime, bounds: bounds_vec }
+                },
+            ))
             .collect()
     }
 
@@ -429,7 +425,7 @@ where
         &mut self,
         item_def_id: DefId,
         param_env: ty::ParamEnv<'tcx>,
-        mut existing_predicates: Vec<WherePredicate>,
+        mut existing_predicates: ThinVec<WherePredicate>,
         vid_to_region: FxHashMap<ty::RegionVid, ty::Region<'tcx>>,
     ) -> Generics {
         debug!(
@@ -453,7 +449,9 @@ where
             .filter(|p| {
                 !orig_bounds.contains(p)
                     || match p.kind().skip_binder() {
-                        ty::PredicateKind::Trait(pred) => pred.def_id() == sized_trait,
+                        ty::PredicateKind::Clause(ty::Clause::Trait(pred)) => {
+                            pred.def_id() == sized_trait
+                        }
                         _ => false,
                     }
             })
@@ -475,6 +473,12 @@ where
 
         let mut ty_to_fn: FxHashMap<Type, (PolyTrait, Option<Type>)> = Default::default();
 
+        // FIXME: This code shares much of the logic found in `clean_ty_generics` and
+        //        `simplify::where_clause`. Consider deduplicating it to avoid diverging
+        //        implementations.
+        //        Further, the code below does not merge (partially re-sugared) bounds like
+        //        `Tr<A = T>` & `Tr<B = U>` and it does not render higher-ranked parameters
+        //        originating from equality predicates.
         for p in clean_where_predicates {
             let (orig_p, p) = (p, clean_predicate(p, self.cx));
             if p.is_none() {
@@ -525,8 +529,8 @@ where
                             GenericBound::TraitBound(ref mut p, _) => {
                                 // Insert regions into the for_generics hash map first, to ensure
                                 // that we don't end up with duplicate bounds (e.g., for<'b, 'b>)
-                                for_generics.extend(p.generic_params.clone());
-                                p.generic_params = for_generics.into_iter().collect();
+                                for_generics.extend(p.generic_params.drain(..));
+                                p.generic_params.extend(for_generics);
                                 self.is_fn_trait(&p.trait_)
                             }
                             _ => false,
@@ -549,15 +553,17 @@ where
                 WherePredicate::RegionPredicate { lifetime, bounds } => {
                     lifetime_to_bounds.entry(lifetime).or_default().extend(bounds);
                 }
-                WherePredicate::EqPredicate { lhs, rhs } => {
-                    match lhs {
-                        Type::QPath { ref assoc, ref self_type, ref trait_, .. } => {
+                WherePredicate::EqPredicate { lhs, rhs, bound_params } => {
+                    match *lhs {
+                        Type::QPath(box QPathData {
+                            ref assoc, ref self_type, ref trait_, ..
+                        }) => {
                             let ty = &*self_type;
                             let mut new_trait = trait_.clone();
 
                             if self.is_fn_trait(trait_) && assoc.name == sym::Output {
                                 ty_to_fn
-                                    .entry(*ty.clone())
+                                    .entry(ty.clone())
                                     .and_modify(|e| {
                                         *e = (e.0.clone(), Some(rhs.ty().unwrap().clone()))
                                     })
@@ -582,21 +588,22 @@ where
                                 // to 'T: Iterator<Item=u8>'
                                 GenericArgs::AngleBracketed { ref mut bindings, .. } => {
                                     bindings.push(TypeBinding {
-                                        assoc: *assoc.clone(),
-                                        kind: TypeBindingKind::Equality { term: rhs },
+                                        assoc: assoc.clone(),
+                                        kind: TypeBindingKind::Equality { term: *rhs },
                                     });
                                 }
                                 GenericArgs::Parenthesized { .. } => {
                                     existing_predicates.push(WherePredicate::EqPredicate {
                                         lhs: lhs.clone(),
                                         rhs,
+                                        bound_params,
                                     });
                                     continue; // If something other than a Fn ends up
                                     // with parentheses, leave it alone
                                 }
                             }
 
-                            let bounds = ty_to_bounds.entry(*ty.clone()).or_default();
+                            let bounds = ty_to_bounds.entry(ty.clone()).or_default();
 
                             bounds.insert(GenericBound::TraitBound(
                                 PolyTrait { trait_: new_trait, generic_params: Vec::new() },
@@ -613,7 +620,7 @@ where
                             ));
                             // Avoid creating any new duplicate bounds later in the outer
                             // loop
-                            ty_to_traits.entry(*ty.clone()).or_default().insert(trait_.clone());
+                            ty_to_traits.entry(ty.clone()).or_default().insert(trait_.clone());
                         }
                         _ => panic!("Unexpected LHS {:?} for {:?}", lhs, item_def_id),
                     }
@@ -654,7 +661,7 @@ where
     /// both for visual consistency between 'rustdoc' runs, and to
     /// make writing tests much easier
     #[inline]
-    fn sort_where_predicates(&self, predicates: &mut Vec<WherePredicate>) {
+    fn sort_where_predicates(&self, predicates: &mut [WherePredicate]) {
         // We should never have identical bounds - and if we do,
         // they're visually identical as well. Therefore, using
         // an unstable sort is fine.
@@ -701,7 +708,7 @@ where
     /// approach is probably somewhat slower, but the small number of items
     /// involved (impls rarely have more than a few bounds) means that it
     /// shouldn't matter in practice.
-    fn unstable_debug_sort<T: Debug>(&self, vec: &mut Vec<T>) {
+    fn unstable_debug_sort<T: Debug>(&self, vec: &mut [T]) {
         vec.sort_by_cached_key(|x| format!("{:?}", x))
     }
 

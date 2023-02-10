@@ -1,3 +1,5 @@
+#![deny(rustc::untranslatable_diagnostic)]
+#![deny(rustc::diagnostic_outside_of_impl)]
 use rustc_data_structures::fx::FxIndexSet;
 use rustc_index::bit_set::SparseBitMatrix;
 use rustc_index::interval::IntervalSet;
@@ -25,7 +27,7 @@ impl RegionValueElements {
     pub(crate) fn new(body: &Body<'_>) -> Self {
         let mut num_points = 0;
         let statements_before_block: IndexVec<BasicBlock, usize> = body
-            .basic_blocks()
+            .basic_blocks
             .iter()
             .map(|block_data| {
                 let v = num_points;
@@ -37,7 +39,7 @@ impl RegionValueElements {
         debug!("RegionValueElements: num_points={:#?}", num_points);
 
         let mut basic_blocks = IndexVec::with_capacity(num_points);
-        for (bb, bb_data) in body.basic_blocks().iter_enumerated() {
+        for (bb, bb_data) in body.basic_blocks.iter_enumerated() {
             basic_blocks.extend((0..=bb_data.statements.len()).map(|_| bb));
         }
 
@@ -88,12 +90,14 @@ impl RegionValueElements {
 rustc_index::newtype_index! {
     /// A single integer representing a `Location` in the MIR control-flow
     /// graph. Constructed efficiently from `RegionValueElements`.
-    pub struct PointIndex { DEBUG_FORMAT = "PointIndex({})" }
+    #[debug_format = "PointIndex({})"]
+    pub struct PointIndex {}
 }
 
 rustc_index::newtype_index! {
     /// A single integer representing a `ty::Placeholder`.
-    pub struct PlaceholderIndex { DEBUG_FORMAT = "PlaceholderIndex({})" }
+    #[debug_format = "PlaceholderIndex({})"]
+    pub struct PlaceholderIndex {}
 }
 
 /// An individual element in a region value -- the value of a
@@ -183,6 +187,7 @@ pub(crate) struct PlaceholderIndices {
 }
 
 impl PlaceholderIndices {
+    /// Returns the `PlaceholderIndex` for the inserted `PlaceholderRegion`
     pub(crate) fn insert(&mut self, placeholder: ty::PlaceholderRegion) -> PlaceholderIndex {
         let (index, _) = self.indices.insert_full(placeholder);
         index.into()

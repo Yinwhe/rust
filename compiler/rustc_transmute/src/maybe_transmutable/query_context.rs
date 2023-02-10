@@ -76,13 +76,9 @@ mod rustc {
                 }
             };
 
-            let ret = if self.visibility(def_id).is_accessible_from(parent, *self) {
-                true
-            } else {
-                false
-            };
+            let ret: bool = self.visibility(def_id).is_accessible_from(parent, *self);
 
-            tracing::trace!(?ret, "ret");
+            trace!(?ret, "ret");
             ret
         }
 

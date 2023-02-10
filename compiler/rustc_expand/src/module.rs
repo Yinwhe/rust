@@ -1,13 +1,17 @@
 use crate::base::ModuleData;
+use crate::errors::{
+    ModuleCircular, ModuleFileNotFound, ModuleInBlock, ModuleInBlockName, ModuleMultipleCandidates,
+};
 use rustc_ast::ptr::P;
-use rustc_ast::{token, Attribute, Inline, Item, ModSpans};
-use rustc_errors::{struct_span_err, DiagnosticBuilder, ErrorGuaranteed};
+use rustc_ast::{token, AttrVec, Attribute, Inline, Item, ModSpans};
+use rustc_errors::{DiagnosticBuilder, ErrorGuaranteed};
 use rustc_parse::new_parser_from_file;
 use rustc_parse::validate_attr;
 use rustc_session::parse::ParseSess;
 use rustc_session::Session;
 use rustc_span::symbol::{sym, Ident};
 use rustc_span::Span;
+use std::iter::once;
 
 use std::path::{self, Path, PathBuf};
 
@@ -48,7 +52,7 @@ pub(crate) fn parse_external_mod(
     span: Span, // The span to blame on errors.
     module: &ModuleData,
     mut dir_ownership: DirOwnership,
-    attrs: &mut Vec<Attribute>,
+    attrs: &mut AttrVec,
 ) -> ParsedExternalMod {
     // We bail on the first error, but that error does not cause a fatal error... (1)
     let result: Result<_, ModError<'_>> = try {
@@ -63,9 +67,9 @@ pub(crate) fn parse_external_mod(
 
         // Actually parse the external file as a module.
         let mut parser = new_parser_from_file(&sess.parse_sess, &mp.file_path, Some(span));
-        let (mut inner_attrs, items, inner_span) =
+        let (inner_attrs, items, inner_span) =
             parser.parse_mod(&token::Eof).map_err(|err| ModError::ParserError(err))?;
-        attrs.append(&mut inner_attrs);
+        attrs.extend(inner_attrs);
         (items, inner_span, mp.file_path)
     };
     // (1) ...instead, we return a dummy module.
@@ -242,57 +246,41 @@ pub fn default_submod_path<'a>(
 
 impl ModError<'_> {
     fn report(self, sess: &Session, span: Span) -> ErrorGuaranteed {
-        let diag = &sess.parse_sess.span_diagnostic;
         match self {
             ModError::CircularInclusion(file_paths) => {
-                let mut msg = String::from("circular modules: ");
-                for file_path in &file_paths {
-                    msg.push_str(&file_path.display().to_string());
-                    msg.push_str(" -> ");
-                }
-                msg.push_str(&file_paths[0].display().to_string());
-                diag.struct_span_err(span, &msg)
+                let path_to_string = |path: &PathBuf| path.display().to_string();
+
+                let paths = file_paths
+                    .iter()
+                    .map(path_to_string)
+                    .chain(once(path_to_string(&file_paths[0])))
+                    .collect::<Vec<_>>();
+
+                let modules = paths.join(" -> ");
+
+                sess.emit_err(ModuleCircular { span, modules })
             }
-            ModError::ModInBlock(ident) => {
-                let msg = "cannot declare a non-inline module inside a block unless it has a path attribute";
-                let mut err = diag.struct_span_err(span, msg);
-                if let Some(ident) = ident {
-                    let note =
-                        format!("maybe `use` the module `{}` instead of redeclaring it", ident);
-                    err.span_note(span, &note);
-                }
-                err
-            }
-            ModError::FileNotFound(ident, default_path, secondary_path) => {
-                let mut err = struct_span_err!(
-                    diag,
+            ModError::ModInBlock(ident) => sess.emit_err(ModuleInBlock {
+                span,
+                name: ident.map(|name| ModuleInBlockName { span, name }),
+            }),
+            ModError::FileNotFound(name, default_path, secondary_path) => {
+                sess.emit_err(ModuleFileNotFound {
                     span,
-                    E0583,
-                    "file not found for module `{}`",
-                    ident,
-                );
-                err.help(&format!(
-                    "to create the module `{}`, create file \"{}\" or \"{}\"",
-                    ident,
-                    default_path.display(),
-                    secondary_path.display(),
-                ));
-                err
+                    name,
+                    default_path: default_path.display().to_string(),
+                    secondary_path: secondary_path.display().to_string(),
+                })
             }
-            ModError::MultipleCandidates(ident, default_path, secondary_path) => {
-                let mut err = struct_span_err!(
-                    diag,
+            ModError::MultipleCandidates(name, default_path, secondary_path) => {
+                sess.emit_err(ModuleMultipleCandidates {
                     span,
-                    E0761,
-                    "file for module `{}` found at both \"{}\" and \"{}\"",
-                    ident,
-                    default_path.display(),
-                    secondary_path.display(),
-                );
-                err.help("delete or rename one of them to remove the ambiguity");
-                err
+                    name,
+                    default_path: default_path.display().to_string(),
+                    secondary_path: secondary_path.display().to_string(),
+                })
             }
-            ModError::ParserError(err) => err,
-        }.emit()
+            ModError::ParserError(mut err) => err.emit(),
+        }
     }
 }

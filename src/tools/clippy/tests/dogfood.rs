@@ -20,7 +20,14 @@ fn dogfood_clippy() {
     }
 
     // "" is the root package
-    for package in &["", "clippy_dev", "clippy_lints", "clippy_utils", "rustc_tools_util"] {
+    for package in &[
+        "",
+        "clippy_dev",
+        "clippy_lints",
+        "clippy_utils",
+        "lintcheck",
+        "rustc_tools_util",
+    ] {
         run_clippy_for_package(package, &["-D", "clippy::all", "-D", "clippy::pedantic"]);
     }
 }
@@ -87,11 +94,11 @@ fn run_clippy_for_package(project: &str, args: &[&str]) {
 
     if cfg!(feature = "internal") {
         // internal lints only exist if we build with the internal feature
-        command.args(&["-D", "clippy::internal"]);
+        command.args(["-D", "clippy::internal"]);
     } else {
         // running a clippy built without internal lints on the clippy source
         // that contains e.g. `allow(clippy::invalid_paths)`
-        command.args(&["-A", "unknown_lints"]);
+        command.args(["-A", "unknown_lints"]);
     }
 
     let output = command.output().unwrap();

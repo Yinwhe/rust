@@ -53,7 +53,7 @@ fn render(
     let (call, escaped_call) = match &func_kind {
         FuncKind::Method(_, Some(receiver)) => (
             format!("{}.{}", receiver.unescaped(), name.unescaped()).into(),
-            format!("{}.{}", receiver, name).into(),
+            format!("{receiver}.{name}").into(),
         ),
         _ => (name.unescaped().to_smol_str(), name.to_smol_str()),
     };
@@ -79,18 +79,18 @@ fn render(
         ..ctx.completion_relevance()
     });
 
-    if let Some(ref_match) = compute_ref_match(completion, &ret_type) {
-        match func_kind {
-            FuncKind::Function(path_ctx) => {
-                item.ref_match(ref_match, path_ctx.path.syntax().text_range().start());
-            }
-            FuncKind::Method(DotAccess { receiver: Some(receiver), .. }, _) => {
-                if let Some(original_expr) = completion.sema.original_ast_node(receiver.clone()) {
+    match func_kind {
+        FuncKind::Function(path_ctx) => {
+            super::path_ref_match(completion, path_ctx, &ret_type, &mut item);
+        }
+        FuncKind::Method(DotAccess { receiver: Some(receiver), .. }, _) => {
+            if let Some(original_expr) = completion.sema.original_ast_node(receiver.clone()) {
+                if let Some(ref_match) = compute_ref_match(completion, &ret_type) {
                     item.ref_match(ref_match, original_expr.syntax().text_range().start());
                 }
             }
-            _ => (),
         }
+        _ => (),
     }
 
     item.set_documentation(ctx.docs(func))
@@ -162,7 +162,7 @@ pub(super) fn add_call_parens<'b>(
     cov_mark::hit!(inserts_parens_for_function_calls);
 
     let (snippet, label_suffix) = if self_param.is_none() && params.is_empty() {
-        (format!("{}()$0", escaped_name), "()")
+        (format!("{escaped_name}()$0"), "()")
     } else {
         builder.trigger_call_info();
         let snippet = if let Some(CallableSnippets::FillArguments) = ctx.config.callable {
@@ -174,7 +174,7 @@ pub(super) fn add_call_parens<'b>(
                             let smol_str = n.to_smol_str();
                             let text = smol_str.as_str().trim_start_matches('_');
                             let ref_ = ref_of_param(ctx, text, param.ty());
-                            f(&format_args!("${{{}:{}{}}}", index + offset, ref_, text))
+                            f(&format_args!("${{{}:{ref_}{text}}}", index + offset))
                         }
                         None => {
                             let name = match param.ty().as_adt() {
@@ -185,7 +185,7 @@ pub(super) fn add_call_parens<'b>(
                                     .map(|s| to_lower_snake_case(s.as_str()))
                                     .unwrap_or_else(|| "_".to_string()),
                             };
-                            f(&format_args!("${{{}:{}}}", index + offset, name))
+                            f(&format_args!("${{{}:{name}}}", index + offset))
                         }
                     }
                 });
@@ -200,12 +200,12 @@ pub(super) fn add_call_parens<'b>(
                     )
                 }
                 None => {
-                    format!("{}({})$0", escaped_name, function_params_snippet)
+                    format!("{escaped_name}({function_params_snippet})$0")
                 }
             }
         } else {
             cov_mark::hit!(suppress_arg_snippets);
-            format!("{}($0)", escaped_name)
+            format!("{escaped_name}($0)")
         };
 
         (snippet, "(…)")

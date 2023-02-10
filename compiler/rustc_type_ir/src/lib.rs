@@ -1,6 +1,8 @@
 #![feature(fmt_helpers_for_derive)]
 #![feature(min_specialization)]
 #![feature(rustc_attrs)]
+#![deny(rustc::untranslatable_diagnostic)]
+#![deny(rustc::diagnostic_outside_of_impl)]
 
 #[macro_use]
 extern crate bitflags;
@@ -17,9 +19,14 @@ use std::mem::discriminant;
 
 pub mod codec;
 pub mod sty;
+pub mod ty_info;
 
 pub use codec::*;
 pub use sty::*;
+pub use ty_info::*;
+
+/// Needed so we can use #[derive(HashStable_Generic)]
+pub trait HashStableContext {}
 
 pub trait Interner {
     type AdtDef: Clone + Debug + Hash + PartialEq + Eq + PartialOrd + Ord;
@@ -35,12 +42,12 @@ pub trait Interner {
     type ListBinderExistentialPredicate: Clone + Debug + Hash + PartialEq + Eq + PartialOrd + Ord;
     type BinderListTy: Clone + Debug + Hash + PartialEq + Eq + PartialOrd + Ord;
     type ListTy: Clone + Debug + Hash + PartialEq + Eq + PartialOrd + Ord;
-    type ProjectionTy: Clone + Debug + Hash + PartialEq + Eq + PartialOrd + Ord;
+    type AliasTy: Clone + Debug + Hash + PartialEq + Eq + PartialOrd + Ord;
     type ParamTy: Clone + Debug + Hash + PartialEq + Eq + PartialOrd + Ord;
     type BoundTy: Clone + Debug + Hash + PartialEq + Eq + PartialOrd + Ord;
     type PlaceholderType: Clone + Debug + Hash + PartialEq + Eq + PartialOrd + Ord;
     type InferTy: Clone + Debug + Hash + PartialEq + Eq + PartialOrd + Ord;
-    type DelaySpanBugEmitted: Clone + Debug + Hash + PartialEq + Eq + PartialOrd + Ord;
+    type ErrorGuaranteed: Clone + Debug + Hash + PartialEq + Eq + PartialOrd + Ord;
     type PredicateKind: Clone + Debug + Hash + PartialEq + Eq;
     type AllocId: Clone + Debug + Hash + PartialEq + Eq + PartialOrd + Ord;
 
@@ -55,10 +62,10 @@ pub trait InternAs<T: ?Sized, R> {
     type Output;
     fn intern_with<F>(self, f: F) -> Self::Output
     where
-        F: FnOnce(&T) -> R;
+        F: FnOnce(&[T]) -> R;
 }
 
-impl<I, T, R, E> InternAs<[T], R> for I
+impl<I, T, R, E> InternAs<T, R> for I
 where
     E: InternIteratorElement<T, R>,
     I: Iterator<Item = E>,
@@ -213,7 +220,8 @@ bitflags! {
                                           // which is different from how types/const are freshened.
                                           | TypeFlags::HAS_TY_FRESH.bits
                                           | TypeFlags::HAS_CT_FRESH.bits
-                                          | TypeFlags::HAS_FREE_LOCAL_REGIONS.bits;
+                                          | TypeFlags::HAS_FREE_LOCAL_REGIONS.bits
+                                          | TypeFlags::HAS_RE_ERASED.bits;
 
         /// Does this have `Projection`?
         const HAS_TY_PROJECTION           = 1 << 10;
@@ -234,22 +242,33 @@ bitflags! {
         /// Basically anything but `ReLateBound` and `ReErased`.
         const HAS_FREE_REGIONS            = 1 << 14;
 
-        /// Does this have any `ReLateBound` regions? Used to check
-        /// if a global bound is safe to evaluate.
+        /// Does this have any `ReLateBound` regions?
         const HAS_RE_LATE_BOUND           = 1 << 15;
+        /// Does this have any `Bound` types?
+        const HAS_TY_LATE_BOUND           = 1 << 16;
+        /// Does this have any `ConstKind::Bound` consts?
+        const HAS_CT_LATE_BOUND           = 1 << 17;
+        /// Does this have any bound variables?
+        /// Used to check if a global bound is safe to evaluate.
+        const HAS_LATE_BOUND              = TypeFlags::HAS_RE_LATE_BOUND.bits
+                                          | TypeFlags::HAS_TY_LATE_BOUND.bits
+                                          | TypeFlags::HAS_CT_LATE_BOUND.bits;
 
         /// Does this have any `ReErased` regions?
-        const HAS_RE_ERASED               = 1 << 16;
+        const HAS_RE_ERASED               = 1 << 18;
 
         /// Does this value have parameters/placeholders/inference variables which could be
         /// replaced later, in a way that would change the results of `impl` specialization?
-        const STILL_FURTHER_SPECIALIZABLE = 1 << 17;
+        const STILL_FURTHER_SPECIALIZABLE = 1 << 19;
 
         /// Does this value have `InferTy::FreshTy/FreshIntTy/FreshFloatTy`?
-        const HAS_TY_FRESH                = 1 << 18;
+        const HAS_TY_FRESH                = 1 << 20;
 
         /// Does this value have `InferConst::Fresh`?
-        const HAS_CT_FRESH                = 1 << 19;
+        const HAS_CT_FRESH                = 1 << 21;
+
+        /// Does this have `Generator` or `GeneratorWitness`?
+        const HAS_TY_GENERATOR            = 1 << 22;
     }
 }
 
@@ -293,9 +312,10 @@ rustc_index::newtype_index! {
     /// is the outer fn.
     ///
     /// [dbi]: https://en.wikipedia.org/wiki/De_Bruijn_index
+    #[derive(HashStable_Generic)]
+    #[debug_format = "DebruijnIndex({})"]
     pub struct DebruijnIndex {
-        DEBUG_FORMAT = "DebruijnIndex({})",
-        const INNERMOST = 0,
+        const INNERMOST = 0;
     }
 }
 
@@ -364,7 +384,7 @@ impl DebruijnIndex {
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
-#[derive(Encodable, Decodable)]
+#[derive(Encodable, Decodable, HashStable_Generic)]
 pub enum IntTy {
     Isize,
     I8,
@@ -411,7 +431,7 @@ impl IntTy {
 }
 
 #[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Copy, Debug)]
-#[derive(Encodable, Decodable)]
+#[derive(Encodable, Decodable, HashStable_Generic)]
 pub enum UintTy {
     Usize,
     U8,
@@ -458,7 +478,7 @@ impl UintTy {
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
-#[derive(Encodable, Decodable)]
+#[derive(Encodable, Decodable, HashStable_Generic)]
 pub enum FloatTy {
     F32,
     F64,
@@ -491,9 +511,8 @@ pub struct FloatVarValue(pub FloatTy);
 
 rustc_index::newtype_index! {
     /// A **ty**pe **v**ariable **ID**.
-    pub struct TyVid {
-        DEBUG_FORMAT = "_#{}t"
-    }
+    #[debug_format = "_#{}t"]
+    pub struct TyVid {}
 }
 
 /// An **int**egral (`u32`, `i32`, `usize`, etc.) type **v**ariable **ID**.
@@ -595,7 +614,7 @@ impl UnifyKey for FloatVid {
     }
 }
 
-#[derive(Copy, Clone, PartialEq, Decodable, Encodable, Hash)]
+#[derive(Copy, Clone, PartialEq, Decodable, Encodable, Hash, HashStable_Generic)]
 #[rustc_pass_by_value]
 pub enum Variance {
     Covariant,     // T<A> <: T<B> iff A <: B -- e.g., function return type
@@ -664,46 +683,16 @@ impl Variance {
     }
 }
 
-impl<CTX> HashStable<CTX> for DebruijnIndex {
-    fn hash_stable(&self, ctx: &mut CTX, hasher: &mut StableHasher) {
-        self.as_u32().hash_stable(ctx, hasher);
-    }
-}
-
-impl<CTX> HashStable<CTX> for IntTy {
-    fn hash_stable(&self, ctx: &mut CTX, hasher: &mut StableHasher) {
-        discriminant(self).hash_stable(ctx, hasher);
-    }
-}
-
-impl<CTX> HashStable<CTX> for UintTy {
-    fn hash_stable(&self, ctx: &mut CTX, hasher: &mut StableHasher) {
-        discriminant(self).hash_stable(ctx, hasher);
-    }
-}
-
-impl<CTX> HashStable<CTX> for FloatTy {
-    fn hash_stable(&self, ctx: &mut CTX, hasher: &mut StableHasher) {
-        discriminant(self).hash_stable(ctx, hasher);
-    }
-}
-
 impl<CTX> HashStable<CTX> for InferTy {
     fn hash_stable(&self, ctx: &mut CTX, hasher: &mut StableHasher) {
         use InferTy::*;
         discriminant(self).hash_stable(ctx, hasher);
         match self {
-            TyVar(v) => v.as_u32().hash_stable(ctx, hasher),
-            IntVar(v) => v.index.hash_stable(ctx, hasher),
-            FloatVar(v) => v.index.hash_stable(ctx, hasher),
+            TyVar(_) | IntVar(_) | FloatVar(_) => {
+                panic!("type variables should not be hashed: {self:?}")
+            }
             FreshTy(v) | FreshIntTy(v) | FreshFloatTy(v) => v.hash_stable(ctx, hasher),
         }
-    }
-}
-
-impl<CTX> HashStable<CTX> for Variance {
-    fn hash_stable(&self, ctx: &mut CTX, hasher: &mut StableHasher) {
-        discriminant(self).hash_stable(ctx, hasher);
     }
 }
 
@@ -741,9 +730,9 @@ impl fmt::Debug for InferTy {
             TyVar(ref v) => v.fmt(f),
             IntVar(ref v) => v.fmt(f),
             FloatVar(ref v) => v.fmt(f),
-            FreshTy(v) => write!(f, "FreshTy({:?})", v),
-            FreshIntTy(v) => write!(f, "FreshIntTy({:?})", v),
-            FreshFloatTy(v) => write!(f, "FreshFloatTy({:?})", v),
+            FreshTy(v) => write!(f, "FreshTy({v:?})"),
+            FreshIntTy(v) => write!(f, "FreshIntTy({v:?})"),
+            FreshFloatTy(v) => write!(f, "FreshFloatTy({v:?})"),
         }
     }
 }
@@ -766,9 +755,9 @@ impl fmt::Display for InferTy {
             TyVar(_) => write!(f, "_"),
             IntVar(_) => write!(f, "{}", "{integer}"),
             FloatVar(_) => write!(f, "{}", "{float}"),
-            FreshTy(v) => write!(f, "FreshTy({})", v),
-            FreshIntTy(v) => write!(f, "FreshIntTy({})", v),
-            FreshFloatTy(v) => write!(f, "FreshFloatTy({})", v),
+            FreshTy(v) => write!(f, "FreshTy({v})"),
+            FreshIntTy(v) => write!(f, "FreshIntTy({v})"),
+            FreshFloatTy(v) => write!(f, "FreshFloatTy({v})"),
         }
     }
 }
@@ -809,9 +798,9 @@ rustc_index::newtype_index! {
     /// declared, but a type name in a non-zero universe is a placeholder
     /// type -- an idealized representative of "types in general" that we
     /// use for checking generic functions.
-    pub struct UniverseIndex {
-        DEBUG_FORMAT = "U{}",
-    }
+    #[derive(HashStable_Generic)]
+    #[debug_format = "U{}"]
+    pub struct UniverseIndex {}
 }
 
 impl UniverseIndex {
@@ -846,11 +835,5 @@ impl UniverseIndex {
     /// those in `other` (`self < other`).
     pub fn cannot_name(self, other: UniverseIndex) -> bool {
         self.private < other.private
-    }
-}
-
-impl<CTX> HashStable<CTX> for UniverseIndex {
-    fn hash_stable(&self, ctx: &mut CTX, hasher: &mut StableHasher) {
-        self.private.hash_stable(ctx, hasher);
     }
 }

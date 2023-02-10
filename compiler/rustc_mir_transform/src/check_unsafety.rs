@@ -1,17 +1,18 @@
-use rustc_data_structures::fx::FxHashMap;
+use rustc_data_structures::fx::FxHashSet;
 use rustc_errors::struct_span_err;
 use rustc_hir as hir;
+use rustc_hir::def::DefKind;
 use rustc_hir::def_id::{DefId, LocalDefId};
 use rustc_hir::hir_id::HirId;
 use rustc_hir::intravisit;
+use rustc_hir::{BlockCheckMode, ExprKind, Node};
 use rustc_middle::mir::visit::{MutatingUseContext, PlaceContext, Visitor};
+use rustc_middle::mir::*;
 use rustc_middle::ty::query::Providers;
 use rustc_middle::ty::{self, TyCtxt};
-use rustc_middle::{lint, mir::*};
 use rustc_session::lint::builtin::{UNSAFE_OP_IN_UNSAFE_FN, UNUSED_UNSAFE};
 use rustc_session::lint::Level;
 
-use std::collections::hash_map;
 use std::ops::Bound;
 
 pub struct UnsafetyChecker<'a, 'tcx> {
@@ -23,10 +24,7 @@ pub struct UnsafetyChecker<'a, 'tcx> {
     param_env: ty::ParamEnv<'tcx>,
 
     /// Used `unsafe` blocks in this function. This is used for the "unused_unsafe" lint.
-    ///
-    /// The keys are the used `unsafe` blocks, the UnusedUnsafeKind indicates whether
-    /// or not any of the usages happen at a place that doesn't allow `unsafe_op_in_unsafe_fn`.
-    used_unsafe_blocks: FxHashMap<HirId, UsedUnsafeBlockData>,
+    used_unsafe_blocks: FxHashSet<HirId>,
 }
 
 impl<'a, 'tcx> UnsafetyChecker<'a, 'tcx> {
@@ -105,11 +103,11 @@ impl<'tcx> Visitor<'tcx> for UnsafetyChecker<'_, 'tcx> {
             | StatementKind::Retag { .. }
             | StatementKind::AscribeUserType(..)
             | StatementKind::Coverage(..)
+            | StatementKind::Intrinsic(..)
+            | StatementKind::ConstEvalCounter
             | StatementKind::Nop => {
                 // safe (at least as emitted during MIR construction)
             }
-
-            StatementKind::CopyNonOverlapping(..) => unreachable!(),
         }
         self.super_statement(statement, location);
     }
@@ -128,17 +126,37 @@ impl<'tcx> Visitor<'tcx> for UnsafetyChecker<'_, 'tcx> {
                     }
                 }
                 &AggregateKind::Closure(def_id, _) | &AggregateKind::Generator(def_id, _, _) => {
+                    let def_id = def_id.expect_local();
                     let UnsafetyCheckResult { violations, used_unsafe_blocks, .. } =
                         self.tcx.unsafety_check_result(def_id);
-                    self.register_violations(
-                        violations,
-                        used_unsafe_blocks.iter().map(|(&h, &d)| (h, d)),
-                    );
+                    self.register_violations(violations, used_unsafe_blocks.iter().copied());
                 }
             },
             _ => {}
         }
         self.super_rvalue(rvalue, location);
+    }
+
+    fn visit_operand(&mut self, op: &Operand<'tcx>, location: Location) {
+        if let Operand::Constant(constant) = op {
+            let maybe_uneval = match constant.literal {
+                ConstantKind::Val(..) | ConstantKind::Ty(_) => None,
+                ConstantKind::Unevaluated(uv, _) => Some(uv),
+            };
+
+            if let Some(uv) = maybe_uneval {
+                if uv.promoted.is_none() {
+                    let def_id = uv.def.def_id_for_type_of();
+                    if self.tcx.def_kind(def_id) == DefKind::InlineConst {
+                        let local_def_id = def_id.expect_local();
+                        let UnsafetyCheckResult { violations, used_unsafe_blocks, .. } =
+                            self.tcx.unsafety_check_result(local_def_id);
+                        self.register_violations(violations, used_unsafe_blocks.iter().copied());
+                    }
+                }
+            }
+        }
+        self.super_operand(op, location);
     }
 
     fn visit_place(&mut self, place: &Place<'tcx>, context: PlaceContext, _location: Location) {
@@ -257,22 +275,8 @@ impl<'tcx> UnsafetyChecker<'_, 'tcx> {
     fn register_violations<'a>(
         &mut self,
         violations: impl IntoIterator<Item = &'a UnsafetyViolation>,
-        new_used_unsafe_blocks: impl IntoIterator<Item = (HirId, UsedUnsafeBlockData)>,
+        new_used_unsafe_blocks: impl IntoIterator<Item = HirId>,
     ) {
-        use UsedUnsafeBlockData::{AllAllowedInUnsafeFn, SomeDisallowedInUnsafeFn};
-
-        let update_entry = |this: &mut Self, hir_id, new_usage| {
-            match this.used_unsafe_blocks.entry(hir_id) {
-                hash_map::Entry::Occupied(mut entry) => {
-                    if new_usage == SomeDisallowedInUnsafeFn {
-                        *entry.get_mut() = SomeDisallowedInUnsafeFn;
-                    }
-                }
-                hash_map::Entry::Vacant(entry) => {
-                    entry.insert(new_usage);
-                }
-            };
-        };
         let safety = self.body.source_scopes[self.source_info.scope]
             .local_data
             .as_ref()
@@ -299,22 +303,14 @@ impl<'tcx> UnsafetyChecker<'_, 'tcx> {
                 }
             }),
             Safety::BuiltinUnsafe => {}
-            Safety::ExplicitUnsafe(hir_id) => violations.into_iter().for_each(|violation| {
-                update_entry(
-                    self,
-                    hir_id,
-                    match self.tcx.lint_level_at_node(UNSAFE_OP_IN_UNSAFE_FN, violation.lint_root).0
-                    {
-                        Level::Allow => AllAllowedInUnsafeFn(violation.lint_root),
-                        _ => SomeDisallowedInUnsafeFn,
-                    },
-                )
+            Safety::ExplicitUnsafe(hir_id) => violations.into_iter().for_each(|_violation| {
+                self.used_unsafe_blocks.insert(hir_id);
             }),
         };
 
-        new_used_unsafe_blocks
-            .into_iter()
-            .for_each(|(hir_id, usage_data)| update_entry(self, hir_id, usage_data));
+        new_used_unsafe_blocks.into_iter().for_each(|hir_id| {
+            self.used_unsafe_blocks.insert(hir_id);
+        });
     }
     fn check_mut_borrowing_layout_constrained_field(
         &mut self,
@@ -340,7 +336,7 @@ impl<'tcx> UnsafetyChecker<'_, 'tcx> {
                             } else if !place
                                 .ty(self.body, self.tcx)
                                 .ty
-                                .is_freeze(self.tcx.at(self.source_info.span), self.param_env)
+                                .is_freeze(self.tcx, self.param_env)
                             {
                                 UnsafetyViolationDetails::BorrowOfLayoutConstrainedField
                             } else {
@@ -411,38 +407,38 @@ enum Context {
 
 struct UnusedUnsafeVisitor<'a, 'tcx> {
     tcx: TyCtxt<'tcx>,
-    used_unsafe_blocks: &'a FxHashMap<HirId, UsedUnsafeBlockData>,
+    used_unsafe_blocks: &'a FxHashSet<HirId>,
     context: Context,
     unused_unsafes: &'a mut Vec<(HirId, UnusedUnsafe)>,
 }
 
 impl<'tcx> intravisit::Visitor<'tcx> for UnusedUnsafeVisitor<'_, 'tcx> {
     fn visit_block(&mut self, block: &'tcx hir::Block<'tcx>) {
-        use UsedUnsafeBlockData::{AllAllowedInUnsafeFn, SomeDisallowedInUnsafeFn};
-
         if let hir::BlockCheckMode::UnsafeBlock(hir::UnsafeSource::UserProvided) = block.rules {
             let used = match self.tcx.lint_level_at_node(UNUSED_UNSAFE, block.hir_id) {
-                (Level::Allow, _) => Some(SomeDisallowedInUnsafeFn),
-                _ => self.used_unsafe_blocks.get(&block.hir_id).copied(),
+                (Level::Allow, _) => true,
+                _ => self.used_unsafe_blocks.contains(&block.hir_id),
             };
             let unused_unsafe = match (self.context, used) {
-                (_, None) => UnusedUnsafe::Unused,
-                (Context::Safe, Some(_))
-                | (Context::UnsafeFn(_), Some(SomeDisallowedInUnsafeFn)) => {
+                (_, false) => UnusedUnsafe::Unused,
+                (Context::Safe, true) | (Context::UnsafeFn(_), true) => {
                     let previous_context = self.context;
                     self.context = Context::UnsafeBlock(block.hir_id);
                     intravisit::walk_block(self, block);
                     self.context = previous_context;
                     return;
                 }
-                (Context::UnsafeFn(hir_id), Some(AllAllowedInUnsafeFn(lint_root))) => {
-                    UnusedUnsafe::InUnsafeFn(hir_id, lint_root)
-                }
-                (Context::UnsafeBlock(hir_id), Some(_)) => UnusedUnsafe::InUnsafeBlock(hir_id),
+                (Context::UnsafeBlock(hir_id), true) => UnusedUnsafe::InUnsafeBlock(hir_id),
             };
             self.unused_unsafes.push((block.hir_id, unused_unsafe));
         }
         intravisit::walk_block(self, block);
+    }
+
+    fn visit_anon_const(&mut self, c: &'tcx hir::AnonConst) {
+        if matches!(self.tcx.def_kind(c.def_id), DefKind::InlineConst) {
+            self.visit_body(self.tcx.hir().body(c.body))
+        }
     }
 
     fn visit_fn(
@@ -451,7 +447,7 @@ impl<'tcx> intravisit::Visitor<'tcx> for UnusedUnsafeVisitor<'_, 'tcx> {
         _fd: &'tcx hir::FnDecl<'tcx>,
         b: hir::BodyId,
         _s: rustc_span::Span,
-        _id: HirId,
+        _id: LocalDefId,
     ) {
         if matches!(fk, intravisit::FnKind::Closure) {
             self.visit_body(self.tcx.hir().body(b))
@@ -462,7 +458,7 @@ impl<'tcx> intravisit::Visitor<'tcx> for UnusedUnsafeVisitor<'_, 'tcx> {
 fn check_unused_unsafe(
     tcx: TyCtxt<'_>,
     def_id: LocalDefId,
-    used_unsafe_blocks: &FxHashMap<HirId, UsedUnsafeBlockData>,
+    used_unsafe_blocks: &FxHashSet<HirId>,
 ) -> Vec<(HirId, UnusedUnsafe)> {
     let body_id = tcx.hir().maybe_body_owned_by(def_id);
 
@@ -496,22 +492,30 @@ fn check_unused_unsafe(
     unused_unsafes
 }
 
-fn unsafety_check_result<'tcx>(
-    tcx: TyCtxt<'tcx>,
+fn unsafety_check_result(
+    tcx: TyCtxt<'_>,
     def: ty::WithOptConstParam<LocalDefId>,
-) -> &'tcx UnsafetyCheckResult {
+) -> &UnsafetyCheckResult {
     debug!("unsafety_violations({:?})", def);
 
     // N.B., this borrow is valid because all the consumers of
     // `mir_built` force this.
     let body = &tcx.mir_built(def).borrow();
 
+    if body.is_custom_mir() {
+        return tcx.arena.alloc(UnsafetyCheckResult {
+            violations: Vec::new(),
+            used_unsafe_blocks: FxHashSet::default(),
+            unused_unsafes: Some(Vec::new()),
+        });
+    }
+
     let param_env = tcx.param_env(def.did);
 
     let mut checker = UnsafetyChecker::new(body, def.did, tcx, param_env);
     checker.visit_body(&body);
 
-    let unused_unsafes = (!tcx.is_closure(def.did.to_def_id()))
+    let unused_unsafes = (!tcx.is_typeck_child(def.did.to_def_id()))
         .then(|| check_unused_unsafe(tcx, def.did, &checker.used_unsafe_blocks));
 
     tcx.arena.alloc(UnsafetyCheckResult {
@@ -523,48 +527,28 @@ fn unsafety_check_result<'tcx>(
 
 fn report_unused_unsafe(tcx: TyCtxt<'_>, kind: UnusedUnsafe, id: HirId) {
     let span = tcx.sess.source_map().guess_head_span(tcx.hir().span(id));
-    tcx.struct_span_lint_hir(UNUSED_UNSAFE, id, span, |lint| {
-        let msg = "unnecessary `unsafe` block";
-        let mut db = lint.build(msg);
-        db.span_label(span, msg);
+    let msg = "unnecessary `unsafe` block";
+    tcx.struct_span_lint_hir(UNUSED_UNSAFE, id, span, msg, |lint| {
+        lint.span_label(span, msg);
         match kind {
             UnusedUnsafe::Unused => {}
             UnusedUnsafe::InUnsafeBlock(id) => {
-                db.span_label(
+                lint.span_label(
                     tcx.sess.source_map().guess_head_span(tcx.hir().span(id)),
                     "because it's nested under this `unsafe` block",
                 );
             }
-            UnusedUnsafe::InUnsafeFn(id, usage_lint_root) => {
-                db.span_label(
-                    tcx.sess.source_map().guess_head_span(tcx.hir().span(id)),
-                    "because it's nested under this `unsafe` fn",
-                )
-                .note(
-                    "this `unsafe` block does contain unsafe operations, \
-                    but those are already allowed in an `unsafe fn`",
-                );
-                let (level, source) =
-                    tcx.lint_level_at_node(UNSAFE_OP_IN_UNSAFE_FN, usage_lint_root);
-                assert_eq!(level, Level::Allow);
-                lint::explain_lint_level_source(
-                    UNSAFE_OP_IN_UNSAFE_FN,
-                    Level::Allow,
-                    source,
-                    &mut db,
-                );
-            }
         }
 
-        db.emit();
+        lint
     });
 }
 
 pub fn check_unsafety(tcx: TyCtxt<'_>, def_id: LocalDefId) {
     debug!("check_unsafety({:?})", def_id);
 
-    // closures are handled by their parent fn.
-    if tcx.is_closure(def_id.to_def_id()) {
+    // closures and inline consts are handled by their parent fn.
+    if tcx.is_typeck_child(def_id.to_def_id()) {
         return;
     }
 
@@ -573,38 +557,55 @@ pub fn check_unsafety(tcx: TyCtxt<'_>, def_id: LocalDefId) {
     for &UnsafetyViolation { source_info, lint_root, kind, details } in violations.iter() {
         let (description, note) = details.description_and_note();
 
-        // Report an error.
-        let unsafe_fn_msg =
-            if unsafe_op_in_unsafe_fn_allowed(tcx, lint_root) { " function or" } else { "" };
-
         match kind {
             UnsafetyViolationKind::General => {
                 // once
-                struct_span_err!(
+                let unsafe_fn_msg = if unsafe_op_in_unsafe_fn_allowed(tcx, lint_root) {
+                    " function or"
+                } else {
+                    ""
+                };
+
+                let mut err = struct_span_err!(
                     tcx.sess,
                     source_info.span,
                     E0133,
                     "{} is unsafe and requires unsafe{} block",
                     description,
                     unsafe_fn_msg,
-                )
-                .span_label(source_info.span, description)
-                .note(note)
-                .emit();
+                );
+                err.span_label(source_info.span, description).note(note);
+                let note_non_inherited = tcx.hir().parent_iter(lint_root).find(|(id, node)| {
+                    if let Node::Expr(block) = node
+                        && let ExprKind::Block(block, _) = block.kind
+                        && let BlockCheckMode::UnsafeBlock(_) = block.rules
+                    {
+                        true
+                    }
+                    else if let Some(sig) = tcx.hir().fn_sig_by_hir_id(*id)
+                        && sig.header.is_unsafe()
+                    {
+                        true
+                    } else {
+                        false
+                    }
+                });
+                if let Some((id, _)) = note_non_inherited {
+                    let span = tcx.hir().span(id);
+                    err.span_label(
+                        tcx.sess.source_map().guess_head_span(span),
+                        "items do not inherit unsafety from separate enclosing items",
+                    );
+                }
+
+                err.emit();
             }
             UnsafetyViolationKind::UnsafeFn => tcx.struct_span_lint_hir(
                 UNSAFE_OP_IN_UNSAFE_FN,
                 lint_root,
                 source_info.span,
-                |lint| {
-                    lint.build(&format!(
-                        "{} is unsafe and requires unsafe block (error E0133)",
-                        description,
-                    ))
-                    .span_label(source_info.span, description)
-                    .note(note)
-                    .emit();
-                },
+                format!("{} is unsafe and requires unsafe block (error E0133)", description,),
+                |lint| lint.span_label(source_info.span, description).note(note),
             ),
         }
     }

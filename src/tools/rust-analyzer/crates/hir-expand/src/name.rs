@@ -62,7 +62,7 @@ impl<'a> UnescapedName<'a> {
                     it.clone()
                 }
             }
-            Repr::TupleField(it) => SmolStr::new(&it.to_string()),
+            Repr::TupleField(it) => SmolStr::new(it.to_string()),
         }
     }
 }
@@ -90,10 +90,16 @@ impl Name {
 
     /// Resolve a name from the text of token.
     fn resolve(raw_text: &str) -> Name {
-        // When `raw_text` starts with "r#" but the name does not coincide with any
-        // keyword, we never need the prefix so we strip it.
         match raw_text.strip_prefix("r#") {
+            // When `raw_text` starts with "r#" but the name does not coincide with any
+            // keyword, we never need the prefix so we strip it.
             Some(text) if !is_raw_identifier(text) => Name::new_text(SmolStr::new(text)),
+            // Keywords (in the current edition) *can* be used as a name in earlier editions of
+            // Rust, e.g. "try" in Rust 2015. Even in such cases, we keep track of them in their
+            // escaped form.
+            None if is_raw_identifier(raw_text) => {
+                Name::new_text(SmolStr::from_iter(["r#", raw_text]))
+            }
             _ => Name::new_text(raw_text.into()),
         }
     }
@@ -133,7 +139,7 @@ impl Name {
     pub fn to_smol_str(&self) -> SmolStr {
         match &self.0 {
             Repr::Text(it) => it.clone(),
-            Repr::TupleField(it) => SmolStr::new(&it.to_string()),
+            Repr::TupleField(it) => SmolStr::new(it.to_string()),
         }
     }
 
@@ -257,9 +263,11 @@ pub mod known {
         Iterator,
         IntoIterator,
         Item,
+        IntoIter,
         Try,
         Ok,
         Future,
+        IntoFuture,
         Result,
         Option,
         Output,
@@ -329,44 +337,7 @@ pub mod known {
         test,
         test_case,
         recursion_limit,
-        // Safe intrinsics
-        abort,
-        add_with_overflow,
-        black_box,
-        bitreverse,
-        bswap,
-        caller_location,
-        ctlz,
-        ctpop,
-        cttz,
-        discriminant_value,
-        forget,
-        likely,
-        maxnumf32,
-        maxnumf64,
-        min_align_of_val,
-        min_align_of,
-        minnumf32,
-        minnumf64,
-        mul_with_overflow,
-        needs_drop,
-        ptr_guaranteed_eq,
-        ptr_guaranteed_ne,
-        rotate_left,
-        rotate_right,
-        rustc_peek,
-        saturating_add,
-        saturating_sub,
-        size_of_val,
-        size_of,
-        sub_with_overflow,
-        type_id,
-        type_name,
-        unlikely,
-        variant_count,
-        wrapping_add,
-        wrapping_mul,
-        wrapping_sub,
+        feature,
         // known methods of lang items
         eq,
         ne,
@@ -393,6 +364,7 @@ pub mod known {
         future_trait,
         index,
         index_mut,
+        into_future,
         mul_assign,
         mul,
         neg,
@@ -409,6 +381,8 @@ pub mod known {
         shr,
         sub_assign,
         sub,
+        unsafe_cell,
+        va_list
     );
 
     // self/Self cannot be used as an identifier

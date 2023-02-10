@@ -1,3 +1,5 @@
+#![deny(rustc::untranslatable_diagnostic)]
+#![deny(rustc::diagnostic_outside_of_impl)]
 //! This pass type-checks the MIR to ensure it is not broken.
 
 use std::rc::Rc;
@@ -27,16 +29,15 @@ use rustc_middle::mir::AssertKind;
 use rustc_middle::mir::*;
 use rustc_middle::ty::adjustment::PointerCast;
 use rustc_middle::ty::cast::CastTy;
-use rustc_middle::ty::subst::{GenericArgKind, SubstsRef, UserSubsts};
+use rustc_middle::ty::subst::{SubstsRef, UserSubsts};
 use rustc_middle::ty::visit::TypeVisitable;
 use rustc_middle::ty::{
-    self, CanonicalUserTypeAnnotation, CanonicalUserTypeAnnotations, OpaqueHiddenType,
-    OpaqueTypeKey, RegionVid, ToPredicate, Ty, TyCtxt, UserType, UserTypeAnnotationIndex,
+    self, Binder, CanonicalUserTypeAnnotation, CanonicalUserTypeAnnotations, Dynamic,
+    OpaqueHiddenType, OpaqueTypeKey, RegionVid, Ty, TyCtxt, UserType, UserTypeAnnotationIndex,
 };
 use rustc_span::def_id::CRATE_DEF_ID;
 use rustc_span::{Span, DUMMY_SP};
 use rustc_target::abi::VariantIdx;
-use rustc_trait_selection::traits::query::type_op;
 use rustc_trait_selection::traits::query::type_op::custom::scrape_region_constraints;
 use rustc_trait_selection::traits::query::type_op::custom::CustomTypeOp;
 use rustc_trait_selection::traits::query::type_op::{TypeOp, TypeOpOutput};
@@ -60,7 +61,7 @@ use crate::{
     region_infer::values::{
         LivenessValues, PlaceholderIndex, PlaceholderIndices, RegionValueElements,
     },
-    region_infer::{ClosureRegionRequirementsExt, TypeTest},
+    region_infer::TypeTest,
     type_check::free_region_relations::{CreateResult, UniversalRegionRelations},
     universal_regions::{DefiningTy, UniversalRegions},
     Upvar,
@@ -122,7 +123,7 @@ mod relate_tys;
 /// - `move_data` -- move-data constructed when performing the maybe-init dataflow analysis
 /// - `elements` -- MIR region map
 pub(crate) fn type_check<'mir, 'tcx>(
-    infcx: &InferCtxt<'_, 'tcx>,
+    infcx: &InferCtxt<'tcx>,
     param_env: ty::ParamEnv<'tcx>,
     body: &Body<'tcx>,
     promoted: &IndexVec<Promoted, Body<'tcx>>,
@@ -137,17 +138,14 @@ pub(crate) fn type_check<'mir, 'tcx>(
     use_polonius: bool,
 ) -> MirTypeckResults<'tcx> {
     let implicit_region_bound = infcx.tcx.mk_region(ty::ReVar(universal_regions.fr_fn_body));
-    let mut universe_causes = FxHashMap::default();
-    universe_causes.insert(ty::UniverseIndex::from_u32(0), UniverseInfo::other());
     let mut constraints = MirTypeckRegionConstraints {
         placeholder_indices: PlaceholderIndices::default(),
         placeholder_index_to_region: IndexVec::default(),
         liveness_constraints: LivenessValues::new(elements.clone()),
         outlives_constraints: OutlivesConstraintSet::default(),
         member_constraints: MemberConstraintSet::default(),
-        closure_bounds_mapping: Default::default(),
         type_tests: Vec::default(),
-        universe_causes,
+        universe_causes: FxHashMap::default(),
     };
 
     let CreateResult {
@@ -164,9 +162,8 @@ pub(crate) fn type_check<'mir, 'tcx>(
 
     debug!(?normalized_inputs_and_output);
 
-    for u in ty::UniverseIndex::ROOT..infcx.universe() {
-        let info = UniverseInfo::other();
-        constraints.universe_causes.insert(u, info);
+    for u in ty::UniverseIndex::ROOT..=infcx.universe() {
+        constraints.universe_causes.insert(u, UniverseInfo::other());
     }
 
     let mut borrowck_context = BorrowCheckContext {
@@ -178,97 +175,15 @@ pub(crate) fn type_check<'mir, 'tcx>(
         upvars,
     };
 
-    let opaque_type_values = type_check_internal(
-        infcx,
-        param_env,
-        body,
-        promoted,
-        &region_bound_pairs,
-        implicit_region_bound,
-        &mut borrowck_context,
-        |mut cx| {
-            debug!("inside extra closure of type_check_internal");
-            cx.equate_inputs_and_outputs(&body, universal_regions, &normalized_inputs_and_output);
-            liveness::generate(
-                &mut cx,
-                body,
-                elements,
-                flow_inits,
-                move_data,
-                location_table,
-                use_polonius,
-            );
-
-            translate_outlives_facts(&mut cx);
-            let opaque_type_values =
-                infcx.inner.borrow_mut().opaque_type_storage.take_opaque_types();
-
-            opaque_type_values
-                .into_iter()
-                .map(|(opaque_type_key, decl)| {
-                    cx.fully_perform_op(
-                        Locations::All(body.span),
-                        ConstraintCategory::OpaqueType,
-                        CustomTypeOp::new(
-                            |infcx| {
-                                infcx.register_member_constraints(
-                                    param_env,
-                                    opaque_type_key,
-                                    decl.hidden_type.ty,
-                                    decl.hidden_type.span,
-                                );
-                                Ok(InferOk { value: (), obligations: vec![] })
-                            },
-                            || "opaque_type_map".to_string(),
-                        ),
-                    )
-                    .unwrap();
-                    let mut hidden_type = infcx.resolve_vars_if_possible(decl.hidden_type);
-                    trace!(
-                        "finalized opaque type {:?} to {:#?}",
-                        opaque_type_key,
-                        hidden_type.ty.kind()
-                    );
-                    if hidden_type.has_infer_types_or_consts() {
-                        infcx.tcx.sess.delay_span_bug(
-                            decl.hidden_type.span,
-                            &format!("could not resolve {:#?}", hidden_type.ty.kind()),
-                        );
-                        hidden_type.ty = infcx.tcx.ty_error();
-                    }
-
-                    (opaque_type_key, (hidden_type, decl.origin))
-                })
-                .collect()
-        },
-    );
-
-    MirTypeckResults { constraints, universal_region_relations, opaque_type_values }
-}
-
-#[instrument(
-    skip(infcx, body, promoted, region_bound_pairs, borrowck_context, extra),
-    level = "debug"
-)]
-fn type_check_internal<'a, 'tcx, R>(
-    infcx: &'a InferCtxt<'a, 'tcx>,
-    param_env: ty::ParamEnv<'tcx>,
-    body: &'a Body<'tcx>,
-    promoted: &'a IndexVec<Promoted, Body<'tcx>>,
-    region_bound_pairs: &'a RegionBoundPairs<'tcx>,
-    implicit_region_bound: ty::Region<'tcx>,
-    borrowck_context: &'a mut BorrowCheckContext<'a, 'tcx>,
-    extra: impl FnOnce(TypeChecker<'a, 'tcx>) -> R,
-) -> R {
-    debug!("body: {:#?}", body);
     let mut checker = TypeChecker::new(
         infcx,
         body,
         param_env,
-        region_bound_pairs,
+        &region_bound_pairs,
         implicit_region_bound,
-        borrowck_context,
+        &mut borrowck_context,
     );
+
     let errors_reported = {
         let mut verifier = TypeVerifier::new(&mut checker, promoted);
         verifier.visit_body(&body);
@@ -280,7 +195,58 @@ fn type_check_internal<'a, 'tcx, R>(
         checker.typeck_mir(body);
     }
 
-    extra(checker)
+    checker.equate_inputs_and_outputs(&body, universal_regions, &normalized_inputs_and_output);
+    checker.check_signature_annotation(&body);
+
+    liveness::generate(
+        &mut checker,
+        body,
+        elements,
+        flow_inits,
+        move_data,
+        location_table,
+        use_polonius,
+    );
+
+    translate_outlives_facts(&mut checker);
+    let opaque_type_values = infcx.take_opaque_types();
+
+    let opaque_type_values = opaque_type_values
+        .into_iter()
+        .map(|(opaque_type_key, decl)| {
+            checker
+                .fully_perform_op(
+                    Locations::All(body.span),
+                    ConstraintCategory::OpaqueType,
+                    CustomTypeOp::new(
+                        |infcx| {
+                            infcx.register_member_constraints(
+                                param_env,
+                                opaque_type_key,
+                                decl.hidden_type.ty,
+                                decl.hidden_type.span,
+                            );
+                            Ok(InferOk { value: (), obligations: vec![] })
+                        },
+                        || "opaque_type_map".to_string(),
+                    ),
+                )
+                .unwrap();
+            let mut hidden_type = infcx.resolve_vars_if_possible(decl.hidden_type);
+            trace!("finalized opaque type {:?} to {:#?}", opaque_type_key, hidden_type.ty.kind());
+            if hidden_type.has_non_region_infer() {
+                let reported = infcx.tcx.sess.delay_span_bug(
+                    decl.hidden_type.span,
+                    &format!("could not resolve {:#?}", hidden_type.ty.kind()),
+                );
+                hidden_type.ty = infcx.tcx.ty_error_with_guaranteed(reported);
+            }
+
+            (opaque_type_key, (hidden_type, decl.origin))
+        })
+        .collect();
+
+    MirTypeckResults { constraints, universal_region_relations, opaque_type_values }
 }
 
 fn translate_outlives_facts(typeck: &mut TypeChecker<'_, '_>) {
@@ -344,6 +310,8 @@ impl<'a, 'b, 'tcx> Visitor<'tcx> for TypeVerifier<'a, 'b, 'tcx> {
     }
 
     fn visit_constant(&mut self, constant: &Constant<'tcx>, location: Location) {
+        debug!(?constant, ?location, "visit_constant");
+
         self.super_constant(constant, location);
         let ty = self.sanitize_type(constant, constant.literal.ty());
 
@@ -387,11 +355,15 @@ impl<'a, 'b, 'tcx> Visitor<'tcx> for TypeVerifier<'a, 'b, 'tcx> {
             let tcx = self.tcx();
             let maybe_uneval = match constant.literal {
                 ConstantKind::Ty(ct) => match ct.kind() {
-                    ty::ConstKind::Unevaluated(uv) => Some(uv),
+                    ty::ConstKind::Unevaluated(_) => {
+                        bug!("should not encounter unevaluated ConstantKind::Ty here, got {:?}", ct)
+                    }
                     _ => None,
                 },
+                ConstantKind::Unevaluated(uv, _) => Some(uv),
                 _ => None,
             };
+
             if let Some(uv) = maybe_uneval {
                 if let Some(promoted) = uv.promoted {
                     let check_err = |verifier: &mut TypeVerifier<'a, 'b, 'tcx>,
@@ -420,23 +392,14 @@ impl<'a, 'b, 'tcx> Visitor<'tcx> for TypeVerifier<'a, 'b, 'tcx> {
                         check_err(self, promoted_body, ty, promoted_ty);
                     }
                 } else {
-                    if let Err(terr) = self.cx.fully_perform_op(
-                        locations,
-                        ConstraintCategory::Boring,
-                        self.cx.param_env.and(type_op::ascribe_user_type::AscribeUserType::new(
-                            constant.literal.ty(),
+                    self.cx.ascribe_user_type(
+                        constant.literal.ty(),
+                        UserType::TypeOf(
                             uv.def.did,
                             UserSubsts { substs: uv.substs, user_self_ty: None },
-                        )),
-                    ) {
-                        span_mirbug!(
-                            self,
-                            constant,
-                            "bad constant type {:?} ({:?})",
-                            constant,
-                            terr
-                        );
-                    }
+                        ),
+                        locations.span(&self.cx.body),
+                    );
                 }
             } else if let Some(static_def_id) = constant.check_static_ptr(tcx) {
                 let unnormalized_ty = tcx.type_of(static_def_id);
@@ -454,12 +417,18 @@ impl<'a, 'b, 'tcx> Visitor<'tcx> for TypeVerifier<'a, 'b, 'tcx> {
             }
 
             if let ty::FnDef(def_id, substs) = *constant.literal.ty().kind() {
+                // const_trait_impl: use a non-const param env when checking that a FnDef type is well formed.
+                // this is because the well-formedness of the function does not need to be proved to have `const`
+                // impls for trait bounds.
                 let instantiated_predicates = tcx.predicates_of(def_id).instantiate(tcx, substs);
+                let prev = self.cx.param_env;
+                self.cx.param_env = prev.without_const();
                 self.cx.normalize_and_prove_instantiated_predicates(
                     def_id,
                     instantiated_predicates,
                     locations,
                 );
+                self.cx.param_env = prev;
             }
         }
     }
@@ -570,10 +539,7 @@ impl<'a, 'b, 'tcx> TypeVerifier<'a, 'b, 'tcx> {
 
         if let PlaceContext::NonMutatingUse(NonMutatingUseContext::Copy) = context {
             let tcx = self.tcx();
-            let trait_ref = ty::TraitRef {
-                def_id: tcx.require_lang_item(LangItem::Copy, Some(self.last_span)),
-                substs: tcx.mk_substs_trait(place_ty.ty, &[]),
-            };
+            let trait_ref = tcx.at(self.last_span).mk_trait_ref(LangItem::Copy, [place_ty.ty]);
 
             // To have a `Copy` operand, the type `T` of the
             // value must be `Copy`. Note that we prove that `T: Copy`,
@@ -607,7 +573,6 @@ impl<'a, 'b, 'tcx> TypeVerifier<'a, 'b, 'tcx> {
         // modify their locations.
         let all_facts = &mut None;
         let mut constraints = Default::default();
-        let mut closure_bounds = Default::default();
         let mut liveness_constraints =
             LivenessValues::new(Rc::new(RegionValueElements::new(&promoted_body)));
         // Don't try to add borrow_region facts for the promoted MIR
@@ -617,10 +582,6 @@ impl<'a, 'b, 'tcx> TypeVerifier<'a, 'b, 'tcx> {
             mem::swap(
                 &mut this.cx.borrowck_context.constraints.outlives_constraints,
                 &mut constraints,
-            );
-            mem::swap(
-                &mut this.cx.borrowck_context.constraints.closure_bounds_mapping,
-                &mut closure_bounds,
             );
             mem::swap(
                 &mut this.cx.borrowck_context.constraints.liveness_constraints,
@@ -643,7 +604,7 @@ impl<'a, 'b, 'tcx> TypeVerifier<'a, 'b, 'tcx> {
 
         let locations = location.to_locations();
         for constraint in constraints.outlives().iter() {
-            let mut constraint = constraint.clone();
+            let mut constraint = *constraint;
             constraint.locations = locations;
             if let ConstraintCategory::Return(_)
             | ConstraintCategory::UseAsConst
@@ -666,18 +627,6 @@ impl<'a, 'b, 'tcx> TypeVerifier<'a, 'b, 'tcx> {
                     .liveness_constraints
                     .add_element(region, location);
             }
-        }
-
-        if !closure_bounds.is_empty() {
-            let combined_bounds_mapping =
-                closure_bounds.into_iter().flat_map(|(_, value)| value).collect();
-            let existing = self
-                .cx
-                .borrowck_context
-                .constraints
-                .closure_bounds_mapping
-                .insert(location, combined_bounds_mapping);
-            assert!(existing.is_none(), "Multiple promoteds/closures at the same location.");
         }
     }
 
@@ -790,6 +739,19 @@ impl<'a, 'b, 'tcx> TypeVerifier<'a, 'b, 'tcx> {
                 }
                 PlaceTy::from_ty(fty)
             }
+            ProjectionElem::OpaqueCast(ty) => {
+                let ty = self.sanitize_type(place, ty);
+                let ty = self.cx.normalize(ty, location);
+                self.cx
+                    .eq_types(
+                        base.ty,
+                        ty,
+                        location.to_locations(),
+                        ConstraintCategory::TypeAnnotation,
+                    )
+                    .unwrap();
+                PlaceTy::from_ty(ty)
+            }
         }
     }
 
@@ -883,7 +845,7 @@ impl<'a, 'b, 'tcx> TypeVerifier<'a, 'b, 'tcx> {
 /// way, it accrues region constraints -- these can later be used by
 /// NLL region checking.
 struct TypeChecker<'a, 'tcx> {
-    infcx: &'a InferCtxt<'a, 'tcx>,
+    infcx: &'a InferCtxt<'tcx>,
     param_env: ty::ParamEnv<'tcx>,
     last_span: Span,
     body: &'a Body<'tcx>,
@@ -942,18 +904,17 @@ pub(crate) struct MirTypeckRegionConstraints<'tcx> {
 
     pub(crate) member_constraints: MemberConstraintSet<'tcx, RegionVid>,
 
-    pub(crate) closure_bounds_mapping:
-        FxHashMap<Location, FxHashMap<(RegionVid, RegionVid), (ConstraintCategory<'tcx>, Span)>>,
-
     pub(crate) universe_causes: FxHashMap<ty::UniverseIndex, UniverseInfo<'tcx>>,
 
     pub(crate) type_tests: Vec<TypeTest<'tcx>>,
 }
 
 impl<'tcx> MirTypeckRegionConstraints<'tcx> {
+    /// Creates a `Region` for a given `PlaceholderRegion`, or returns the
+    /// region that corresponds to a previously created one.
     fn placeholder_region(
         &mut self,
-        infcx: &InferCtxt<'_, 'tcx>,
+        infcx: &InferCtxt<'tcx>,
         placeholder: ty::PlaceholderRegion,
     ) -> ty::Region<'tcx> {
         let placeholder_index = self.placeholder_indices.insert(placeholder);
@@ -1037,7 +998,7 @@ impl Locations {
 
 impl<'a, 'tcx> TypeChecker<'a, 'tcx> {
     fn new(
-        infcx: &'a InferCtxt<'a, 'tcx>,
+        infcx: &'a InferCtxt<'tcx>,
         body: &'a Body<'tcx>,
         param_env: ty::ParamEnv<'tcx>,
         region_bound_pairs: &'a RegionBoundPairs<'tcx>,
@@ -1074,58 +1035,8 @@ impl<'a, 'tcx> TypeChecker<'a, 'tcx> {
         debug!(?self.user_type_annotations);
         for user_annotation in self.user_type_annotations {
             let CanonicalUserTypeAnnotation { span, ref user_ty, inferred_ty } = *user_annotation;
-            let inferred_ty = self.normalize(inferred_ty, Locations::All(span));
             let annotation = self.instantiate_canonical_with_fresh_inference_vars(span, user_ty);
-            match annotation {
-                UserType::Ty(mut ty) => {
-                    ty = self.normalize(ty, Locations::All(span));
-
-                    if let Err(terr) = self.eq_types(
-                        ty,
-                        inferred_ty,
-                        Locations::All(span),
-                        ConstraintCategory::BoringNoLocation,
-                    ) {
-                        span_mirbug!(
-                            self,
-                            user_annotation,
-                            "bad user type ({:?} = {:?}): {:?}",
-                            ty,
-                            inferred_ty,
-                            terr
-                        );
-                    }
-
-                    self.prove_predicate(
-                        ty::Binder::dummy(ty::PredicateKind::WellFormed(inferred_ty.into()))
-                            .to_predicate(self.tcx()),
-                        Locations::All(span),
-                        ConstraintCategory::TypeAnnotation,
-                    );
-                }
-                UserType::TypeOf(def_id, user_substs) => {
-                    if let Err(terr) = self.fully_perform_op(
-                        Locations::All(span),
-                        ConstraintCategory::BoringNoLocation,
-                        self.param_env.and(type_op::ascribe_user_type::AscribeUserType::new(
-                            inferred_ty,
-                            def_id,
-                            user_substs,
-                        )),
-                    ) {
-                        span_mirbug!(
-                            self,
-                            user_annotation,
-                            "bad user type AscribeUserType({:?}, {:?} {:?}, type_of={:?}): {:?}",
-                            inferred_ty,
-                            def_id,
-                            user_substs,
-                            self.tcx().type_of(def_id),
-                            terr,
-                        );
-                    }
-                }
-            }
+            self.ascribe_user_type(inferred_ty, annotation, span);
         }
     }
 
@@ -1186,11 +1097,18 @@ impl<'a, 'tcx> TypeChecker<'a, 'tcx> {
         category: ConstraintCategory<'tcx>,
     ) -> Fallible<()> {
         let annotated_type = self.user_type_annotations[user_ty.base].inferred_ty;
+        trace!(?annotated_type);
         let mut curr_projected_ty = PlaceTy::from_ty(annotated_type);
 
         let tcx = self.infcx.tcx;
 
         for proj in &user_ty.projs {
+            if let ty::Alias(ty::Opaque, ..) = curr_projected_ty.ty.kind() {
+                // There is nothing that we can compare here if we go through an opaque type.
+                // We're always in its defining scope as we can otherwise not project through
+                // it, so we're constraining it anyways.
+                return Ok(());
+            }
             let projected_ty = curr_projected_ty.projection_ty_core(
                 tcx,
                 self.param_env,
@@ -1199,13 +1117,11 @@ impl<'a, 'tcx> TypeChecker<'a, 'tcx> {
                     let ty = this.field_ty(tcx, field);
                     self.normalize(ty, locations)
                 },
+                |_, _| unreachable!(),
             );
             curr_projected_ty = projected_ty;
         }
-        debug!(
-            "user_ty base: {:?} freshened: {:?} projs: {:?} yields: {:?}",
-            user_ty.base, annotated_type, user_ty.projs, curr_projected_ty
-        );
+        trace!(?curr_projected_ty);
 
         let ty = curr_projected_ty.ty;
         self.relate_types(ty, v.xform(ty::Variance::Contravariant), a, locations, category)?;
@@ -1221,8 +1137,8 @@ impl<'a, 'tcx> TypeChecker<'a, 'tcx> {
     fn check_stmt(&mut self, body: &Body<'tcx>, stmt: &Statement<'tcx>, location: Location) {
         let tcx = self.tcx();
         debug!("stmt kind: {:?}", stmt.kind);
-        match stmt.kind {
-            StatementKind::Assign(box (ref place, ref rv)) => {
+        match &stmt.kind {
+            StatementKind::Assign(box (place, rv)) => {
                 // Assignments to temporaries are not "interesting";
                 // they are not caused by the user, but rather artifacts
                 // of lowering. Assignments to other sorts of places *are* interesting
@@ -1302,10 +1218,8 @@ impl<'a, 'tcx> TypeChecker<'a, 'tcx> {
 
                 self.check_rvalue(body, rv, location);
                 if !self.unsized_feature_enabled() {
-                    let trait_ref = ty::TraitRef {
-                        def_id: tcx.require_lang_item(LangItem::Sized, Some(self.last_span)),
-                        substs: tcx.mk_substs_trait(place_ty, &[]),
-                    };
+                    let trait_ref =
+                        tcx.at(self.last_span).mk_trait_ref(LangItem::Sized, [place_ty]);
                     self.prove_trait_ref(
                         trait_ref,
                         location.to_locations(),
@@ -1313,11 +1227,11 @@ impl<'a, 'tcx> TypeChecker<'a, 'tcx> {
                     );
                 }
             }
-            StatementKind::AscribeUserType(box (ref place, ref projection), variance) => {
+            StatementKind::AscribeUserType(box (place, projection), variance) => {
                 let place_ty = place.ty(body, tcx).ty;
                 if let Err(terr) = self.relate_type_and_user_type(
                     place_ty,
-                    variance,
+                    *variance,
                     projection,
                     Locations::All(stmt.source_info.span),
                     ConstraintCategory::TypeAnnotation,
@@ -1334,17 +1248,19 @@ impl<'a, 'tcx> TypeChecker<'a, 'tcx> {
                     );
                 }
             }
-            StatementKind::CopyNonOverlapping(box rustc_middle::mir::CopyNonOverlapping {
-                ..
-            }) => span_bug!(
-                stmt.source_info.span,
-                "Unexpected StatementKind::CopyNonOverlapping, should only appear after lowering_intrinsics",
-            ),
+            StatementKind::Intrinsic(box kind) => match kind {
+                NonDivergingIntrinsic::Assume(op) => self.check_operand(op, location),
+                NonDivergingIntrinsic::CopyNonOverlapping(..) => span_bug!(
+                    stmt.source_info.span,
+                    "Unexpected NonDivergingIntrinsic::CopyNonOverlapping, should only appear after lowering_intrinsics",
+                ),
+            },
             StatementKind::FakeRead(..)
             | StatementKind::StorageLive(..)
             | StatementKind::StorageDead(..)
             | StatementKind::Retag { .. }
             | StatementKind::Coverage(..)
+            | StatementKind::ConstEvalCounter
             | StatementKind::Nop => {}
             StatementKind::Deinit(..) | StatementKind::SetDiscriminant { .. } => {
                 bug!("Statement not allowed in this MIR phase")
@@ -1361,7 +1277,7 @@ impl<'a, 'tcx> TypeChecker<'a, 'tcx> {
     ) {
         let tcx = self.tcx();
         debug!("terminator kind: {:?}", term.kind);
-        match term.kind {
+        match &term.kind {
             TerminatorKind::Goto { .. }
             | TerminatorKind::Resume
             | TerminatorKind::Abort
@@ -1375,7 +1291,7 @@ impl<'a, 'tcx> TypeChecker<'a, 'tcx> {
                 // no checks needed for these
             }
 
-            TerminatorKind::DropAndReplace { ref place, ref value, target: _, unwind: _ } => {
+            TerminatorKind::DropAndReplace { place, value, target: _, unwind: _ } => {
                 let place_ty = place.ty(body, tcx).ty;
                 let rv_ty = value.ty(body, tcx);
 
@@ -1393,38 +1309,16 @@ impl<'a, 'tcx> TypeChecker<'a, 'tcx> {
                     );
                 }
             }
-            TerminatorKind::SwitchInt { ref discr, switch_ty, .. } => {
+            TerminatorKind::SwitchInt { discr, .. } => {
                 self.check_operand(discr, term_location);
 
-                let discr_ty = discr.ty(body, tcx);
-                if let Err(terr) = self.sub_types(
-                    discr_ty,
-                    switch_ty,
-                    term_location.to_locations(),
-                    ConstraintCategory::Assignment,
-                ) {
-                    span_mirbug!(
-                        self,
-                        term,
-                        "bad SwitchInt ({:?} on {:?}): {:?}",
-                        switch_ty,
-                        discr_ty,
-                        terr
-                    );
-                }
+                let switch_ty = discr.ty(body, tcx);
                 if !switch_ty.is_integral() && !switch_ty.is_char() && !switch_ty.is_bool() {
                     span_mirbug!(self, term, "bad SwitchInt discr ty {:?}", switch_ty);
                 }
                 // FIXME: check the values
             }
-            TerminatorKind::Call {
-                ref func,
-                ref args,
-                ref destination,
-                from_hir_call,
-                target,
-                ..
-            } => {
+            TerminatorKind::Call { func, args, destination, from_hir_call, target, .. } => {
                 self.check_operand(func, term_location);
                 for arg in args {
                     self.check_operand(arg, term_location);
@@ -1464,7 +1358,7 @@ impl<'a, 'tcx> TypeChecker<'a, 'tcx> {
                     ConstraintCategory::Boring,
                 );
                 let sig = self.normalize(sig, term_location);
-                self.check_call_dest(body, term, &sig, *destination, target, term_location);
+                self.check_call_dest(body, term, &sig, *destination, *target, term_location);
 
                 // The ordinary liveness rules will ensure that all
                 // regions in the type of the callee are live here. We
@@ -1482,9 +1376,9 @@ impl<'a, 'tcx> TypeChecker<'a, 'tcx> {
                         .add_element(region_vid, term_location);
                 }
 
-                self.check_call_inputs(body, term, &sig, args, term_location, from_hir_call);
+                self.check_call_inputs(body, term, &sig, args, term_location, *from_hir_call);
             }
-            TerminatorKind::Assert { ref cond, ref msg, .. } => {
+            TerminatorKind::Assert { cond, msg, .. } => {
                 self.check_operand(cond, term_location);
 
                 let cond_ty = cond.ty(body, tcx);
@@ -1492,7 +1386,7 @@ impl<'a, 'tcx> TypeChecker<'a, 'tcx> {
                     span_mirbug!(self, term, "bad Assert ({:?}, not bool", cond_ty);
                 }
 
-                if let AssertKind::BoundsCheck { ref len, ref index } = *msg {
+                if let AssertKind::BoundsCheck { len, index } = msg {
                     if len.ty(body, tcx) != tcx.types.usize {
                         span_mirbug!(self, len, "bounds-check length non-usize {:?}", len)
                     }
@@ -1501,7 +1395,7 @@ impl<'a, 'tcx> TypeChecker<'a, 'tcx> {
                     }
                 }
             }
-            TerminatorKind::Yield { ref value, .. } => {
+            TerminatorKind::Yield { value, .. } => {
                 self.check_operand(value, term_location);
 
                 let value_ty = value.ty(body, tcx);
@@ -1592,10 +1486,10 @@ impl<'a, 'tcx> TypeChecker<'a, 'tcx> {
                 }
             }
             None => {
-                if !self
-                    .tcx()
-                    .conservative_is_privately_uninhabited(self.param_env.and(sig.output()))
-                {
+                // The signature in this call can reference region variables,
+                // so erase them before calling a query.
+                let output_ty = self.tcx().erase_regions(sig.output());
+                if !output_ty.is_privately_uninhabited(self.tcx(), self.param_env) {
                     span_mirbug!(self, term, "call to converging function {:?} w/o dest", sig);
                 }
             }
@@ -1628,7 +1522,7 @@ impl<'a, 'tcx> TypeChecker<'a, 'tcx> {
 
             let op_arg_ty = self.normalize(op_arg_ty, term_location);
             let category = if from_hir_call {
-                ConstraintCategory::CallArgument(func_ty)
+                ConstraintCategory::CallArgument(self.infcx.tcx.erase_regions(func_ty))
             } else {
                 ConstraintCategory::Boring
             };
@@ -1777,11 +1671,11 @@ impl<'a, 'tcx> TypeChecker<'a, 'tcx> {
     fn ensure_place_sized(&mut self, ty: Ty<'tcx>, span: Span) {
         let tcx = self.tcx();
 
-        // Erase the regions from `ty` to get a global type.  The
+        // Erase the regions from `ty` to get a global type. The
         // `Sized` bound in no way depends on precise regions, so this
         // shouldn't affect `is_sized`.
         let erased_ty = tcx.erase_regions(ty);
-        if !erased_ty.is_sized(tcx.at(span), self.param_env) {
+        if !erased_ty.is_sized(tcx, self.param_env) {
             // in current MIR construction, all non-control-flow rvalue
             // expressions evaluate through `as_temp` or `into` a return
             // slot or local, so to find all unsized rvalues it is enough
@@ -1841,14 +1735,14 @@ impl<'a, 'tcx> TypeChecker<'a, 'tcx> {
     }
 
     fn check_operand(&mut self, op: &Operand<'tcx>, location: Location) {
+        debug!(?op, ?location, "check_operand");
+
         if let Operand::Constant(constant) = op {
             let maybe_uneval = match constant.literal {
-                ConstantKind::Ty(ct) => match ct.kind() {
-                    ty::ConstKind::Unevaluated(uv) => Some(uv),
-                    _ => None,
-                },
-                _ => None,
+                ConstantKind::Val(..) | ConstantKind::Ty(_) => None,
+                ConstantKind::Unevaluated(uv, _) => Some(uv),
             };
+
             if let Some(uv) = maybe_uneval {
                 if uv.promoted.is_none() {
                     let tcx = self.tcx();
@@ -1871,6 +1765,7 @@ impl<'a, 'tcx> TypeChecker<'a, 'tcx> {
     #[instrument(skip(self, body), level = "debug")]
     fn check_rvalue(&mut self, body: &Body<'tcx>, rvalue: &Rvalue<'tcx>, location: Location) {
         let tcx = self.tcx();
+        let span = body.source_info(location).span;
 
         match rvalue {
             Rvalue::Aggregate(ak, ops) => {
@@ -1894,12 +1789,8 @@ impl<'a, 'tcx> TypeChecker<'a, 'tcx> {
                         }
                         Operand::Move(place) => {
                             // Make sure that repeated elements implement `Copy`.
-                            let span = body.source_info(location).span;
                             let ty = place.ty(body, tcx).ty;
-                            let trait_ref = ty::TraitRef::new(
-                                tcx.require_lang_item(LangItem::Copy, Some(span)),
-                                tcx.mk_substs_trait(ty, &[]),
-                            );
+                            let trait_ref = tcx.at(span).mk_trait_ref(LangItem::Copy, [ty]);
 
                             self.prove_trait_ref(
                                 trait_ref,
@@ -1911,11 +1802,8 @@ impl<'a, 'tcx> TypeChecker<'a, 'tcx> {
                 }
             }
 
-            &Rvalue::NullaryOp(_, ty) => {
-                let trait_ref = ty::TraitRef {
-                    def_id: tcx.require_lang_item(LangItem::Sized, Some(self.last_span)),
-                    substs: tcx.mk_substs_trait(ty, &[]),
-                };
+            &Rvalue::NullaryOp(NullOp::SizeOf | NullOp::AlignOf, ty) => {
+                let trait_ref = tcx.at(span).mk_trait_ref(LangItem::Sized, [ty]);
 
                 self.prove_trait_ref(
                     trait_ref,
@@ -1927,10 +1815,7 @@ impl<'a, 'tcx> TypeChecker<'a, 'tcx> {
             Rvalue::ShallowInitBox(operand, ty) => {
                 self.check_operand(operand, location);
 
-                let trait_ref = ty::TraitRef {
-                    def_id: tcx.require_lang_item(LangItem::Sized, Some(self.last_span)),
-                    substs: tcx.mk_substs_trait(*ty, &[]),
-                };
+                let trait_ref = tcx.at(span).mk_trait_ref(LangItem::Sized, [*ty]);
 
                 self.prove_trait_ref(
                     trait_ref,
@@ -2027,14 +1912,42 @@ impl<'a, 'tcx> TypeChecker<'a, 'tcx> {
 
                     CastKind::Pointer(PointerCast::Unsize) => {
                         let &ty = ty;
-                        let trait_ref = ty::TraitRef {
-                            def_id: tcx
-                                .require_lang_item(LangItem::CoerceUnsized, Some(self.last_span)),
-                            substs: tcx.mk_substs_trait(op.ty(body, tcx), &[ty.into()]),
-                        };
+                        let trait_ref = tcx
+                            .at(span)
+                            .mk_trait_ref(LangItem::CoerceUnsized, [op.ty(body, tcx), ty]);
 
                         self.prove_trait_ref(
                             trait_ref,
+                            location.to_locations(),
+                            ConstraintCategory::Cast,
+                        );
+                    }
+
+                    CastKind::DynStar => {
+                        // get the constraints from the target type (`dyn* Clone`)
+                        //
+                        // apply them to prove that the source type `Foo` implements `Clone` etc
+                        let (existential_predicates, region) = match ty.kind() {
+                            Dynamic(predicates, region, ty::DynStar) => (predicates, region),
+                            _ => panic!("Invalid dyn* cast_ty"),
+                        };
+
+                        let self_ty = op.ty(body, tcx);
+
+                        self.prove_predicates(
+                            existential_predicates
+                                .iter()
+                                .map(|predicate| predicate.with_self_ty(tcx, self_ty)),
+                            location.to_locations(),
+                            ConstraintCategory::Cast,
+                        );
+
+                        let outlives_predicate =
+                            tcx.mk_predicate(Binder::dummy(ty::PredicateKind::Clause(
+                                ty::Clause::TypeOutlives(ty::OutlivesPredicate(self_ty, *region)),
+                            )));
+                        self.prove_predicate(
+                            outlives_predicate,
                             location.to_locations(),
                             ConstraintCategory::Cast,
                         );
@@ -2120,7 +2033,7 @@ impl<'a, 'tcx> TypeChecker<'a, 'tcx> {
                             }
                         };
 
-                        if ty_to_mut == Mutability::Mut && ty_mut == Mutability::Not {
+                        if ty_to_mut.is_mut() && ty_mut.is_not() {
                             span_mirbug!(
                                 self,
                                 rvalue,
@@ -2183,25 +2096,104 @@ impl<'a, 'tcx> TypeChecker<'a, 'tcx> {
                             }
                         }
                     }
-
-                    CastKind::Misc => {
+                    CastKind::IntToInt => {
                         let ty_from = op.ty(body, tcx);
                         let cast_ty_from = CastTy::from_ty(ty_from);
                         let cast_ty_to = CastTy::from_ty(*ty);
-                        // Misc casts are either between floats and ints, or one ptr type to another.
                         match (cast_ty_from, cast_ty_to) {
-                            (
-                                Some(CastTy::Int(_) | CastTy::Float),
-                                Some(CastTy::Int(_) | CastTy::Float),
-                            )
-                            | (Some(CastTy::Ptr(_) | CastTy::FnPtr), Some(CastTy::Ptr(_))) => (),
+                            (Some(CastTy::Int(_)), Some(CastTy::Int(_))) => (),
                             _ => {
                                 span_mirbug!(
                                     self,
                                     rvalue,
-                                    "Invalid Misc cast {:?} -> {:?}",
+                                    "Invalid IntToInt cast {:?} -> {:?}",
                                     ty_from,
-                                    ty,
+                                    ty
+                                )
+                            }
+                        }
+                    }
+                    CastKind::IntToFloat => {
+                        let ty_from = op.ty(body, tcx);
+                        let cast_ty_from = CastTy::from_ty(ty_from);
+                        let cast_ty_to = CastTy::from_ty(*ty);
+                        match (cast_ty_from, cast_ty_to) {
+                            (Some(CastTy::Int(_)), Some(CastTy::Float)) => (),
+                            _ => {
+                                span_mirbug!(
+                                    self,
+                                    rvalue,
+                                    "Invalid IntToFloat cast {:?} -> {:?}",
+                                    ty_from,
+                                    ty
+                                )
+                            }
+                        }
+                    }
+                    CastKind::FloatToInt => {
+                        let ty_from = op.ty(body, tcx);
+                        let cast_ty_from = CastTy::from_ty(ty_from);
+                        let cast_ty_to = CastTy::from_ty(*ty);
+                        match (cast_ty_from, cast_ty_to) {
+                            (Some(CastTy::Float), Some(CastTy::Int(_))) => (),
+                            _ => {
+                                span_mirbug!(
+                                    self,
+                                    rvalue,
+                                    "Invalid FloatToInt cast {:?} -> {:?}",
+                                    ty_from,
+                                    ty
+                                )
+                            }
+                        }
+                    }
+                    CastKind::FloatToFloat => {
+                        let ty_from = op.ty(body, tcx);
+                        let cast_ty_from = CastTy::from_ty(ty_from);
+                        let cast_ty_to = CastTy::from_ty(*ty);
+                        match (cast_ty_from, cast_ty_to) {
+                            (Some(CastTy::Float), Some(CastTy::Float)) => (),
+                            _ => {
+                                span_mirbug!(
+                                    self,
+                                    rvalue,
+                                    "Invalid FloatToFloat cast {:?} -> {:?}",
+                                    ty_from,
+                                    ty
+                                )
+                            }
+                        }
+                    }
+                    CastKind::FnPtrToPtr => {
+                        let ty_from = op.ty(body, tcx);
+                        let cast_ty_from = CastTy::from_ty(ty_from);
+                        let cast_ty_to = CastTy::from_ty(*ty);
+                        match (cast_ty_from, cast_ty_to) {
+                            (Some(CastTy::FnPtr), Some(CastTy::Ptr(_))) => (),
+                            _ => {
+                                span_mirbug!(
+                                    self,
+                                    rvalue,
+                                    "Invalid FnPtrToPtr cast {:?} -> {:?}",
+                                    ty_from,
+                                    ty
+                                )
+                            }
+                        }
+                    }
+                    CastKind::PtrToPtr => {
+                        let ty_from = op.ty(body, tcx);
+                        let cast_ty_from = CastTy::from_ty(ty_from);
+                        let cast_ty_to = CastTy::from_ty(*ty);
+                        match (cast_ty_from, cast_ty_to) {
+                            (Some(CastTy::Ptr(_)), Some(CastTy::Ptr(_))) => (),
+                            _ => {
+                                span_mirbug!(
+                                    self,
+                                    rvalue,
+                                    "Invalid PtrToPtr cast {:?} -> {:?}",
+                                    ty_from,
+                                    ty
                                 )
                             }
                         }
@@ -2451,6 +2443,7 @@ impl<'a, 'tcx> TypeChecker<'a, 'tcx> {
                                 span: location.to_locations().span(body),
                                 category,
                                 variance_info: ty::VarianceDiagInfo::default(),
+                                from_closure: false,
                             });
 
                             match mutbl {
@@ -2497,6 +2490,7 @@ impl<'a, 'tcx> TypeChecker<'a, 'tcx> {
                 }
                 ProjectionElem::Field(..)
                 | ProjectionElem::Downcast(..)
+                | ProjectionElem::OpaqueCast(..)
                 | ProjectionElem::Index(..)
                 | ProjectionElem::ConstantIndex { .. }
                 | ProjectionElem::Subslice { .. } => {
@@ -2524,7 +2518,6 @@ impl<'a, 'tcx> TypeChecker<'a, 'tcx> {
             }
 
             // For closures, we have some **extra requirements** we
-            //
             // have to check. In particular, in their upvars and
             // signatures, closures often reference various regions
             // from the surrounding function -- we call those the
@@ -2545,7 +2538,7 @@ impl<'a, 'tcx> TypeChecker<'a, 'tcx> {
             // clauses on the struct.
             AggregateKind::Closure(def_id, substs)
             | AggregateKind::Generator(def_id, substs, _) => {
-                (def_id.to_def_id(), self.prove_closure_bounds(tcx, def_id, substs, location))
+                (def_id, self.prove_closure_bounds(tcx, def_id.expect_local(), substs, location))
             }
 
             AggregateKind::Array(_) | AggregateKind::Tuple => {
@@ -2567,62 +2560,22 @@ impl<'a, 'tcx> TypeChecker<'a, 'tcx> {
         substs: SubstsRef<'tcx>,
         location: Location,
     ) -> ty::InstantiatedPredicates<'tcx> {
-        if let Some(ref closure_region_requirements) = tcx.mir_borrowck(def_id).closure_requirements
-        {
-            let closure_constraints = QueryRegionConstraints {
-                outlives: closure_region_requirements.apply_requirements(
-                    tcx,
-                    def_id.to_def_id(),
-                    substs,
-                ),
-
-                // Presently, closures never propagate member
-                // constraints to their parents -- they are enforced
-                // locally.  This is largely a non-issue as member
-                // constraints only come from `-> impl Trait` and
-                // friends which don't appear (thus far...) in
-                // closures.
-                member_constraints: vec![],
-            };
-
-            let bounds_mapping = closure_constraints
-                .outlives
-                .iter()
-                .enumerate()
-                .filter_map(|(idx, constraint)| {
-                    let ty::OutlivesPredicate(k1, r2) =
-                        constraint.no_bound_vars().unwrap_or_else(|| {
-                            bug!("query_constraint {:?} contained bound vars", constraint,);
-                        });
-
-                    match k1.unpack() {
-                        GenericArgKind::Lifetime(r1) => {
-                            // constraint is r1: r2
-                            let r1_vid = self.borrowck_context.universal_regions.to_region_vid(r1);
-                            let r2_vid = self.borrowck_context.universal_regions.to_region_vid(r2);
-                            let outlives_requirements =
-                                &closure_region_requirements.outlives_requirements[idx];
-                            Some((
-                                (r1_vid, r2_vid),
-                                (outlives_requirements.category, outlives_requirements.blame_span),
-                            ))
-                        }
-                        GenericArgKind::Type(_) | GenericArgKind::Const(_) => None,
-                    }
-                })
-                .collect();
-
-            let existing = self
-                .borrowck_context
-                .constraints
-                .closure_bounds_mapping
-                .insert(location, bounds_mapping);
-            assert!(existing.is_none(), "Multiple closures at the same location.");
-
-            self.push_region_constraints(
+        if let Some(closure_requirements) = &tcx.mir_borrowck(def_id).closure_requirements {
+            constraint_conversion::ConstraintConversion::new(
+                self.infcx,
+                self.borrowck_context.universal_regions,
+                self.region_bound_pairs,
+                self.implicit_region_bound,
+                self.param_env,
                 location.to_locations(),
-                ConstraintCategory::ClosureBounds,
-                &closure_constraints,
+                DUMMY_SP,                   // irrelevant; will be overrided.
+                ConstraintCategory::Boring, // same as above.
+                &mut self.borrowck_context.constraints,
+            )
+            .apply_closure_requirements(
+                &closure_requirements,
+                def_id.to_def_id(),
+                substs,
             );
         }
 
@@ -2666,7 +2619,7 @@ impl<'a, 'tcx> TypeChecker<'a, 'tcx> {
             self.check_local(&body, local, local_decl);
         }
 
-        for (block, block_data) in body.basic_blocks().iter_enumerated() {
+        for (block, block_data) in body.basic_blocks.iter_enumerated() {
             let mut location = Location { block, statement_index: 0 };
             for stmt in &block_data.statements {
                 if !stmt.source_info.span.is_dummy() {
@@ -2717,7 +2670,7 @@ impl<'tcx> TypeOp<'tcx> for InstantiateOpaqueType<'tcx> {
     /// constraints in our `InferCtxt`
     type ErrorInfo = InstantiateOpaqueType<'tcx>;
 
-    fn fully_perform(mut self, infcx: &InferCtxt<'_, 'tcx>) -> Fallible<TypeOpOutput<'tcx, Self>> {
+    fn fully_perform(mut self, infcx: &InferCtxt<'tcx>) -> Fallible<TypeOpOutput<'tcx, Self>> {
         let (mut output, region_constraints) = scrape_region_constraints(infcx, || {
             Ok(InferOk { value: (), obligations: self.obligations.clone() })
         })?;

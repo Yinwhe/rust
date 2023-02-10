@@ -1570,7 +1570,7 @@ impl<'a, T> CursorMut<'a, T> {
     /// that the cursor points to is unchanged, even if it is the "ghost" node.
     ///
     /// This operation should compute in *O*(1) time.
-    // `push_front` continues to point to "ghost" when it addes a node to mimic
+    // `push_front` continues to point to "ghost" when it adds a node to mimic
     // the behavior of `insert_before` on an empty list.
     #[unstable(feature = "linked_list_cursors", issue = "58533")]
     pub fn push_front(&mut self, elt: T) {
@@ -1613,7 +1613,7 @@ impl<'a, T> CursorMut<'a, T> {
             None
         } else {
             // We can't point to the node that we pop. Copying the behavior of
-            // `remove_current`, we move on the the next node in the sequence.
+            // `remove_current`, we move on to the next node in the sequence.
             // If the list is of length 1 then we end pointing to the "ghost"
             // node at index 0, which is expected.
             if self.list.head == self.current {

@@ -20,12 +20,15 @@
 mod dylib;
 mod abis;
 
+pub mod cli;
+
 use std::{
     collections::{hash_map::Entry, HashMap},
     env,
     ffi::OsString,
     fs,
     path::{Path, PathBuf},
+    thread,
     time::SystemTime,
 };
 
@@ -45,7 +48,7 @@ impl ProcMacroSrv {
     pub fn expand(&mut self, task: ExpandMacro) -> Result<FlatTree, PanicMessage> {
         let expander = self.expander(task.lib.as_ref()).map_err(|err| {
             debug_assert!(false, "should list macros before asking to expand");
-            PanicMessage(format!("failed to load macro: {}", err))
+            PanicMessage(format!("failed to load macro: {err}"))
         })?;
 
         let prev_env = EnvSnapshot::new();
@@ -56,7 +59,7 @@ impl ProcMacroSrv {
             Some(dir) => {
                 let prev_working_dir = std::env::current_dir().ok();
                 if let Err(err) = std::env::set_current_dir(&dir) {
-                    eprintln!("Failed to set the current working dir to {}. Error: {:?}", dir, err)
+                    eprintln!("Failed to set the current working dir to {dir}. Error: {err:?}")
                 }
                 prev_working_dir
             }
@@ -65,18 +68,16 @@ impl ProcMacroSrv {
 
         let macro_body = task.macro_body.to_subtree();
         let attributes = task.attributes.map(|it| it.to_subtree());
-        // FIXME: replace this with std's scoped threads once they stabilize
-        // (then remove dependency on crossbeam)
-        let result = crossbeam::scope(|s| {
-            let res = match s
-                .builder()
+        let result = thread::scope(|s| {
+            let thread = thread::Builder::new()
                 .stack_size(EXPANDER_STACK_SIZE)
                 .name(task.macro_name.clone())
-                .spawn(|_| {
+                .spawn_scoped(s, || {
                     expander
                         .expand(&task.macro_name, &macro_body, attributes.as_ref())
                         .map(|it| FlatTree::new(&it))
-                }) {
+                });
+            let res = match thread {
                 Ok(handle) => handle.join(),
                 Err(e) => std::panic::resume_unwind(Box::new(e)),
             };
@@ -86,10 +87,6 @@ impl ProcMacroSrv {
                 Err(e) => std::panic::resume_unwind(e),
             }
         });
-        let result = match result {
-            Ok(result) => result,
-            Err(e) => std::panic::resume_unwind(e),
-        };
 
         prev_env.rollback();
 
@@ -115,14 +112,16 @@ impl ProcMacroSrv {
     }
 
     fn expander(&mut self, path: &Path) -> Result<&dylib::Expander, String> {
-        let time = fs::metadata(path).and_then(|it| it.modified()).map_err(|err| {
-            format!("Failed to get file metadata for {}: {:?}", path.display(), err)
-        })?;
+        let time = fs::metadata(path)
+            .and_then(|it| it.modified())
+            .map_err(|err| format!("Failed to get file metadata for {}: {err}", path.display()))?;
 
         Ok(match self.expanders.entry((path.to_path_buf(), time)) {
-            Entry::Vacant(v) => v.insert(dylib::Expander::new(path).map_err(|err| {
-                format!("Cannot create expander for {}: {:?}", path.display(), err)
-            })?),
+            Entry::Vacant(v) => {
+                v.insert(dylib::Expander::new(path).map_err(|err| {
+                    format!("Cannot create expander for {}: {err}", path.display())
+                })?)
+            }
             Entry::Occupied(e) => e.into_mut(),
         })
     }
@@ -154,7 +153,10 @@ impl EnvSnapshot {
     }
 }
 
-pub mod cli;
+#[cfg(all(feature = "sysroot-abi", test))]
+mod tests;
 
 #[cfg(test)]
-mod tests;
+pub fn proc_macro_test_dylib_path() -> std::path::PathBuf {
+    proc_macro_test::PROC_MACRO_TEST_LOCATION.into()
+}

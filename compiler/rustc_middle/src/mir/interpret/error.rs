@@ -16,8 +16,6 @@ pub enum ErrorHandled {
     /// Already reported an error for this evaluation, and the compilation is
     /// *guaranteed* to fail. Warnings/lints *must not* produce `Reported`.
     Reported(ErrorGuaranteed),
-    /// Already emitted a lint for this evaluation.
-    Linted,
     /// Don't emit an error, the evaluation failed because the MIR was generic
     /// and the substs didn't fully monomorphize it.
     TooGeneric,
@@ -89,18 +87,6 @@ fn print_backtrace(backtrace: &Backtrace) {
     eprintln!("\n\nAn error occurred in miri:\n{}", backtrace);
 }
 
-impl From<ErrorHandled> for InterpErrorInfo<'_> {
-    fn from(err: ErrorHandled) -> Self {
-        match err {
-            ErrorHandled::Reported(ErrorGuaranteed { .. }) | ErrorHandled::Linted => {
-                err_inval!(ReferencedConstant)
-            }
-            ErrorHandled::TooGeneric => err_inval!(TooGeneric),
-        }
-        .into()
-    }
-}
-
 impl From<ErrorGuaranteed> for InterpErrorInfo<'_> {
     fn from(err: ErrorGuaranteed) -> Self {
         InterpError::InvalidProgram(InvalidProgramInfo::AlreadyReported(err)).into()
@@ -138,9 +124,6 @@ impl<'tcx> From<InterpError<'tcx>> for InterpErrorInfo<'tcx> {
 pub enum InvalidProgramInfo<'tcx> {
     /// Resolution can fail if we are in a too generic context.
     TooGeneric,
-    /// Cannot compute this constant because it depends on another one
-    /// which already produced an error.
-    ReferencedConstant,
     /// Abort in case errors are already reported.
     AlreadyReported(ErrorGuaranteed),
     /// An error occurred during layout computation.
@@ -158,9 +141,11 @@ impl fmt::Display for InvalidProgramInfo<'_> {
         use InvalidProgramInfo::*;
         match self {
             TooGeneric => write!(f, "encountered overly generic constant"),
-            ReferencedConstant => write!(f, "referenced constant has errors"),
             AlreadyReported(ErrorGuaranteed { .. }) => {
-                write!(f, "encountered constants with type errors, stopping evaluation")
+                write!(
+                    f,
+                    "an error has already been reported elsewhere (this should not usually be printed)"
+                )
             }
             Layout(ref err) => write!(f, "{err}"),
             FnAbiAdjustForForeignAbi(ref err) => write!(f, "{err}"),
@@ -401,14 +386,17 @@ impl fmt::Display for UndefinedBehaviorInfo {
 pub enum UnsupportedOpInfo {
     /// Free-form case. Only for errors that are never caught!
     Unsupported(String),
-    /// Encountered a pointer where we needed raw bytes.
-    ReadPointerAsBytes,
-    /// Overwriting parts of a pointer; the resulting state cannot be represented in our
-    /// `Allocation` data structure. See <https://github.com/rust-lang/miri/issues/2181>.
-    PartialPointerOverwrite(Pointer<AllocId>),
     //
     // The variants below are only reachable from CTFE/const prop, miri will never emit them.
     //
+    /// Overwriting parts of a pointer; without knowing absolute addresses, the resulting state
+    /// cannot be represented by the CTFE interpreter.
+    PartialPointerOverwrite(Pointer<AllocId>),
+    /// Attempting to `copy` parts of a pointer to somewhere else; without knowing absolute
+    /// addresses, the resulting state cannot be represented by the CTFE interpreter.
+    PartialPointerCopy(Pointer<AllocId>),
+    /// Encountered a pointer where we needed raw bytes.
+    ReadPointerAsBytes,
     /// Accessing thread local statics
     ThreadLocalStatic(DefId),
     /// Accessing an unsupported extern static.
@@ -420,10 +408,13 @@ impl fmt::Display for UnsupportedOpInfo {
         use UnsupportedOpInfo::*;
         match self {
             Unsupported(ref msg) => write!(f, "{msg}"),
-            ReadPointerAsBytes => write!(f, "unable to turn pointer into raw bytes"),
             PartialPointerOverwrite(ptr) => {
                 write!(f, "unable to overwrite parts of a pointer in memory at {ptr:?}")
             }
+            PartialPointerCopy(ptr) => {
+                write!(f, "unable to copy parts of a pointer from memory at {ptr:?}")
+            }
+            ReadPointerAsBytes => write!(f, "unable to turn pointer into raw bytes"),
             ThreadLocalStatic(did) => write!(f, "cannot access thread local static ({did:?})"),
             ReadExternStatic(did) => write!(f, "cannot read from extern static ({did:?})"),
         }
@@ -439,8 +430,10 @@ pub enum ResourceExhaustionInfo {
     ///
     /// The exact limit is set by the `const_eval_limit` attribute.
     StepLimitReached,
-    /// There is not enough memory to perform an allocation.
+    /// There is not enough memory (on the host) to perform an allocation.
     MemoryExhausted,
+    /// The address space (of the target) is full.
+    AddressSpaceFull,
 }
 
 impl fmt::Display for ResourceExhaustionInfo {
@@ -455,6 +448,9 @@ impl fmt::Display for ResourceExhaustionInfo {
             }
             MemoryExhausted => {
                 write!(f, "tried to allocate more memory than available to compiler")
+            }
+            AddressSpaceFull => {
+                write!(f, "there are no more free addresses in the address space")
             }
         }
     }
@@ -472,12 +468,7 @@ impl<T: Any> AsAny for T {
 }
 
 /// A trait for machine-specific errors (or other "machine stop" conditions).
-pub trait MachineStopType: AsAny + fmt::Display + Send {
-    /// If `true`, emit a hard error instead of going through the `CONST_ERR` lint
-    fn is_hard_err(&self) -> bool {
-        false
-    }
-}
+pub trait MachineStopType: AsAny + fmt::Display + Send {}
 
 impl dyn MachineStopType {
     #[inline(always)]
@@ -535,17 +526,5 @@ impl InterpError<'_> {
                 | InterpError::UndefinedBehavior(UndefinedBehaviorInfo::ValidationFailure { .. })
                 | InterpError::UndefinedBehavior(UndefinedBehaviorInfo::Ub(_))
         )
-    }
-
-    /// Should this error be reported as a hard error, preventing compilation, or a soft error,
-    /// causing a deny-by-default lint?
-    pub fn is_hard_err(&self) -> bool {
-        use InterpError::*;
-        match *self {
-            MachineStop(ref err) => err.is_hard_err(),
-            UndefinedBehavior(_) => true,
-            ResourceExhaustion(ResourceExhaustionInfo::MemoryExhausted) => true,
-            _ => false,
-        }
     }
 }

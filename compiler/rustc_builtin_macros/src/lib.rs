@@ -7,13 +7,17 @@
 #![feature(box_patterns)]
 #![feature(decl_macro)]
 #![feature(if_let_guard)]
+#![feature(is_some_and)]
 #![feature(is_sorted)]
-#![feature(let_else)]
+#![feature(let_chains)]
 #![feature(proc_macro_internals)]
 #![feature(proc_macro_quote)]
 #![recursion_limit = "256"]
 
 extern crate proc_macro;
+
+#[macro_use]
+extern crate tracing;
 
 use crate::deriving::*;
 
@@ -21,6 +25,7 @@ use rustc_expand::base::{MacroExpanderFn, ResolverExpand, SyntaxExtensionKind};
 use rustc_expand::proc_macro::BangProcMacro;
 use rustc_span::symbol::sym;
 
+mod alloc_error_handler;
 mod assert;
 mod cfg;
 mod cfg_accessible;
@@ -40,6 +45,7 @@ mod log_syntax;
 mod source_util;
 mod test;
 mod trace_macros;
+mod type_ascribe;
 mod util;
 
 pub mod asm;
@@ -87,13 +93,16 @@ pub fn register_builtin_macros(resolver: &mut dyn ResolverExpand) {
         unreachable: edition_panic::expand_unreachable,
         stringify: source_util::expand_stringify,
         trace_macros: trace_macros::expand_trace_macros,
+        type_ascribe: type_ascribe::expand_type_ascribe,
     }
 
     register_attr! {
+        alloc_error_handler: alloc_error_handler::expand,
         bench: test::expand_bench,
         cfg_accessible: cfg_accessible::Expander,
         cfg_eval: cfg_eval::expand,
-        derive: derive::Expander,
+        derive: derive::Expander(false),
+        derive_const: derive::Expander(true),
         global_allocator: global_allocator::expand,
         test: test::expand_test,
         test_case: test::expand_test_case,

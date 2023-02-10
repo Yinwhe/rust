@@ -91,9 +91,14 @@
 #![feature(never_type)]
 #![recursion_limit = "256"]
 #![allow(rustc::potential_query_instability)]
+#![deny(rustc::untranslatable_diagnostic)]
+#![deny(rustc::diagnostic_outside_of_impl)]
 
 #[macro_use]
 extern crate rustc_middle;
+
+#[macro_use]
+extern crate tracing;
 
 use rustc_hir::def::DefKind;
 use rustc_hir::def_id::{CrateNum, LOCAL_CRATE};
@@ -105,11 +110,10 @@ use rustc_middle::ty::subst::SubstsRef;
 use rustc_middle::ty::{self, Instance, TyCtxt};
 use rustc_session::config::SymbolManglingVersion;
 
-use tracing::debug;
-
 mod legacy;
 mod v0;
 
+pub mod errors;
 pub mod test;
 pub mod typeid;
 
@@ -265,8 +269,7 @@ fn compute_symbol_name<'tcx>(
 
     debug_assert!(
         rustc_demangle::try_demangle(&symbol).is_ok(),
-        "compute_symbol_name: `{}` cannot be demangled",
-        symbol
+        "compute_symbol_name: `{symbol}` cannot be demangled"
     );
 
     symbol

@@ -15,14 +15,13 @@ use std::iter;
 impl<'a, 'tcx> Builder<'a, 'tcx> {
     /// Compile `expr`, storing the result into `destination`, which
     /// is assumed to be uninitialized.
+    #[instrument(level = "debug", skip(self))]
     pub(crate) fn expr_into_dest(
         &mut self,
         destination: Place<'tcx>,
         mut block: BasicBlock,
         expr: &Expr<'tcx>,
     ) -> BlockAnd<()> {
-        debug!("expr_into_dest(destination={:?}, block={:?}, expr={:?})", destination, block, expr);
-
         // since we frequently have to reference `self` from within a
         // closure, where `self` would be shadowed, it's easier to
         // just use the name `this` uniformly
@@ -46,7 +45,7 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
                     })
                 })
             }
-            ExprKind::Block { body: ref ast_block } => {
+            ExprKind::Block { block: ast_block } => {
                 this.ast_block(destination, block, ast_block, source_info)
             }
             ExprKind::Match { scrutinee, ref arms } => {
@@ -75,7 +74,7 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
                                 this.source_info(then_expr.span)
                             };
                             let (then_block, else_block) =
-                                this.in_if_then_scope(condition_scope, |this| {
+                                this.in_if_then_scope(condition_scope, then_expr.span, |this| {
                                     let then_blk = unpack!(this.then_else_break(
                                         block,
                                         &this.thir[cond],
@@ -108,8 +107,8 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
             }
             ExprKind::Let { expr, ref pat } => {
                 let scope = this.local_scope();
-                let (true_block, false_block) = this.in_if_then_scope(scope, |this| {
-                    this.lower_let_expr(block, &this.thir[expr], pat, scope, None, expr_span)
+                let (true_block, false_block) = this.in_if_then_scope(scope, expr_span, |this| {
+                    this.lower_let_expr(block, &this.thir[expr], pat, scope, None, expr_span, true)
                 });
 
                 this.cfg.push_assign_constant(
@@ -184,7 +183,7 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
                     LogicalOp::And => (else_block, shortcircuit_block),
                     LogicalOp::Or => (shortcircuit_block, else_block),
                 };
-                let term = TerminatorKind::if_(this.tcx, lhs, blocks.0, blocks.1);
+                let term = TerminatorKind::if_(lhs, blocks.0, blocks.1);
                 this.cfg.terminate(block, source_info, term);
 
                 this.cfg.push_assign_constant(
@@ -272,15 +271,10 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
                         // MIR checks and ultimately whether code is accepted or not. We can only
                         // omit the return edge if a return type is visibly uninhabited to a module
                         // that makes the call.
-                        target: if this.tcx.is_ty_uninhabited_from(
-                            this.parent_module,
-                            expr.ty,
-                            this.param_env,
-                        ) {
-                            None
-                        } else {
-                            Some(success)
-                        },
+                        target: expr
+                            .ty
+                            .is_inhabited_from(this.tcx, this.parent_module, this.param_env)
+                            .then_some(success),
                         from_hir_call,
                         fn_span,
                     },
@@ -314,11 +308,11 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
                 this.cfg.push_assign(block, source_info, destination, address_of);
                 block.unit()
             }
-            ExprKind::Adt(box Adt {
+            ExprKind::Adt(box AdtExpr {
                 adt_def,
                 variant_index,
                 substs,
-                user_ty,
+                ref user_ty,
                 ref fields,
                 ref base,
             }) => {
@@ -364,12 +358,8 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
                         .map(|(n, ty)| match fields_map.get(&n) {
                             Some(v) => v.clone(),
                             None => {
-                                let place_builder = place_builder.clone();
-                                this.consume_by_copy_or_move(
-                                    place_builder
-                                        .field(n, *ty)
-                                        .into_place(this.tcx, this.typeck_results),
-                                )
+                                let place = place_builder.clone_project(PlaceElem::Field(n, *ty));
+                                this.consume_by_copy_or_move(place.to_place(this))
                             }
                         })
                         .collect()
@@ -378,10 +368,10 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
                 };
 
                 let inferred_ty = expr.ty;
-                let user_ty = user_ty.map(|ty| {
+                let user_ty = user_ty.as_ref().map(|user_ty| {
                     this.canonical_user_type_annotations.push(CanonicalUserTypeAnnotation {
                         span: source_info.span,
-                        user_ty: ty,
+                        user_ty: user_ty.clone(),
                         inferred_ty,
                     })
                 });
@@ -400,7 +390,12 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
                 );
                 block.unit()
             }
-            ExprKind::InlineAsm { template, ref operands, options, line_spans } => {
+            ExprKind::InlineAsm(box InlineAsmExpr {
+                template,
+                ref operands,
+                options,
+                line_spans,
+            }) => {
                 use rustc_middle::{mir, thir};
                 let operands = operands
                     .into_iter()

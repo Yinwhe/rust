@@ -27,9 +27,7 @@ use rustc_codegen_ssa::traits::*;
 use rustc_fs_util::path_to_c_string;
 use rustc_hir::def::CtorKind;
 use rustc_hir::def_id::{DefId, LOCAL_CRATE};
-use rustc_index::vec::{Idx, IndexVec};
 use rustc_middle::bug;
-use rustc_middle::mir::{self, GeneratorLayout};
 use rustc_middle::ty::layout::{LayoutOf, TyAndLayout};
 use rustc_middle::ty::subst::GenericArgKind;
 use rustc_middle::ty::{
@@ -42,7 +40,6 @@ use rustc_span::{self, FileNameDisplayPreference, SourceFile};
 use rustc_symbol_mangling::typeid_for_trait_ref;
 use rustc_target::abi::{Align, Size};
 use smallvec::smallvec;
-use tracing::debug;
 
 use libc::{c_char, c_longlong, c_uint};
 use std::borrow::Cow;
@@ -51,7 +48,6 @@ use std::hash::{Hash, Hasher};
 use std::iter;
 use std::path::{Path, PathBuf};
 use std::ptr;
-use tracing::instrument;
 
 impl PartialEq for llvm::Metadata {
     fn eq(&self, other: &Self) -> bool {
@@ -115,7 +111,7 @@ macro_rules! return_if_di_node_created_in_meantime {
 
 /// Extract size and alignment from a TyAndLayout.
 #[inline]
-fn size_and_align_of<'tcx>(ty_and_layout: TyAndLayout<'tcx>) -> (Size, Align) {
+fn size_and_align_of(ty_and_layout: TyAndLayout<'_>) -> (Size, Align) {
     (ty_and_layout.size, ty_and_layout.align.abi)
 }
 
@@ -786,10 +782,10 @@ pub fn build_compile_unit_di_node<'ll, 'tcx>(
     codegen_unit_name: &str,
     debug_context: &CodegenUnitDebugContext<'ll, 'tcx>,
 ) -> &'ll DIDescriptor {
-    let mut name_in_debuginfo = match tcx.sess.local_crate_source_file {
-        Some(ref path) => path.clone(),
-        None => PathBuf::from(tcx.crate_name(LOCAL_CRATE).as_str()),
-    };
+    let mut name_in_debuginfo = tcx
+        .sess
+        .local_crate_source_file()
+        .unwrap_or_else(|| PathBuf::from(tcx.crate_name(LOCAL_CRATE).as_str()));
 
     // To avoid breaking split DWARF, we need to ensure that each codegen unit
     // has a unique `DW_AT_name`. This is because there's a remote chance that
@@ -1000,7 +996,7 @@ fn build_struct_type_di_node<'ll, 'tcx>(
                 .iter()
                 .enumerate()
                 .map(|(i, f)| {
-                    let field_name = if variant_def.ctor_kind == CtorKind::Fn {
+                    let field_name = if variant_def.ctor_kind() == Some(CtorKind::Fn) {
                         // This is a tuple struct
                         tuple_field_name(i)
                     } else {
@@ -1027,33 +1023,6 @@ fn build_struct_type_di_node<'ll, 'tcx>(
 //=-----------------------------------------------------------------------------
 // Tuples
 //=-----------------------------------------------------------------------------
-
-/// Returns names of captured upvars for closures and generators.
-///
-/// Here are some examples:
-///  - `name__field1__field2` when the upvar is captured by value.
-///  - `_ref__name__field` when the upvar is captured by reference.
-///
-/// For generators this only contains upvars that are shared by all states.
-fn closure_saved_names_of_captured_variables(tcx: TyCtxt<'_>, def_id: DefId) -> SmallVec<String> {
-    let body = tcx.optimized_mir(def_id);
-
-    body.var_debug_info
-        .iter()
-        .filter_map(|var| {
-            let is_ref = match var.value {
-                mir::VarDebugInfoContents::Place(place) if place.local == mir::Local::new(1) => {
-                    // The projection is either `[.., Field, Deref]` or `[.., Field]`. It
-                    // implies whether the variable is captured by value or by reference.
-                    matches!(place.projection.last().unwrap(), mir::ProjectionElem::Deref)
-                }
-                _ => return None,
-            };
-            let prefix = if is_ref { "_ref__" } else { "" };
-            Some(prefix.to_owned() + var.name.as_str())
-        })
-        .collect()
-}
 
 /// Builds the DW_TAG_member debuginfo nodes for the upvars of a closure or generator.
 /// For a generator, this will handle upvars shared by all states.
@@ -1085,7 +1054,7 @@ fn build_upvar_field_di_nodes<'ll, 'tcx>(
             .all(|&t| t == cx.tcx.normalize_erasing_regions(ParamEnv::reveal_all(), t))
     );
 
-    let capture_names = closure_saved_names_of_captured_variables(cx.tcx, def_id);
+    let capture_names = cx.tcx.closure_saved_names_of_captured_variables(def_id);
     let layout = cx.layout_of(closure_or_generator_ty);
 
     up_var_tys
@@ -1229,43 +1198,6 @@ fn build_union_type_di_node<'ll, 'tcx>(
         // Generics:
         |cx| build_generic_type_param_di_nodes(cx, union_type),
     )
-}
-
-// FIXME(eddyb) maybe precompute this? Right now it's computed once
-// per generator monomorphization, but it doesn't depend on substs.
-fn generator_layout_and_saved_local_names<'tcx>(
-    tcx: TyCtxt<'tcx>,
-    def_id: DefId,
-) -> (&'tcx GeneratorLayout<'tcx>, IndexVec<mir::GeneratorSavedLocal, Option<Symbol>>) {
-    let body = tcx.optimized_mir(def_id);
-    let generator_layout = body.generator_layout().unwrap();
-    let mut generator_saved_local_names = IndexVec::from_elem(None, &generator_layout.field_tys);
-
-    let state_arg = mir::Local::new(1);
-    for var in &body.var_debug_info {
-        let mir::VarDebugInfoContents::Place(place) = &var.value else { continue };
-        if place.local != state_arg {
-            continue;
-        }
-        match place.projection[..] {
-            [
-                // Deref of the `Pin<&mut Self>` state argument.
-                mir::ProjectionElem::Field(..),
-                mir::ProjectionElem::Deref,
-                // Field of a variant of the state.
-                mir::ProjectionElem::Downcast(_, variant),
-                mir::ProjectionElem::Field(field, _),
-            ] => {
-                let name = &mut generator_saved_local_names
-                    [generator_layout.variant_fields[variant][field]];
-                if name.is_none() {
-                    name.replace(var.name);
-                }
-            }
-            _ => {}
-        }
-    }
-    (generator_layout, generator_saved_local_names)
 }
 
 /// Computes the type parameters for a type, if any, for the given metadata.
@@ -1500,24 +1432,18 @@ fn vcall_visibility_metadata<'ll, 'tcx>(
         // If there is not LTO and the visibility in public, we have to assume that the vtable can
         // be seen from anywhere. With multiple CGUs, the vtable is quasi-public.
         (Lto::No | Lto::ThinLocal, Visibility::Public, _)
-        | (Lto::No, Visibility::Restricted(_) | Visibility::Invisible, false) => {
-            VCallVisibility::Public
-        }
+        | (Lto::No, Visibility::Restricted(_), false) => VCallVisibility::Public,
         // With LTO and a quasi-public visibility, the usages of the functions of the vtable are
         // all known by the `LinkageUnit`.
         // FIXME: LLVM only supports this optimization for `Lto::Fat` currently. Once it also
         // supports `Lto::Thin` the `VCallVisibility` may have to be adjusted for those.
         (Lto::Fat | Lto::Thin, Visibility::Public, _)
-        | (
-            Lto::ThinLocal | Lto::Thin | Lto::Fat,
-            Visibility::Restricted(_) | Visibility::Invisible,
-            false,
-        ) => VCallVisibility::LinkageUnit,
+        | (Lto::ThinLocal | Lto::Thin | Lto::Fat, Visibility::Restricted(_), false) => {
+            VCallVisibility::LinkageUnit
+        }
         // If there is only one CGU, private vtables can only be seen by that CGU/translation unit
         // and therefore we know of all usages of functions in the vtable.
-        (_, Visibility::Restricted(_) | Visibility::Invisible, true) => {
-            VCallVisibility::TranslationUnit
-        }
+        (_, Visibility::Restricted(_), true) => VCallVisibility::TranslationUnit,
     };
 
     let trait_ref_typeid = typeid_for_trait_ref(cx.tcx, trait_ref);
@@ -1572,6 +1498,11 @@ pub fn create_vtable_di_node<'ll, 'tcx>(
     if cx.sess().opts.debuginfo != DebugInfo::Full {
         return;
     }
+
+    // When full debuginfo is enabled, we want to try and prevent vtables from being
+    // merged. Otherwise debuggers will have a hard time mapping from dyn pointer
+    // to concrete type.
+    llvm::SetUnnamedAddress(vtable, llvm::UnnamedAddr::No);
 
     let vtable_name =
         compute_debuginfo_vtable_name(cx.tcx, ty, poly_trait_ref, VTableNameKind::GlobalVariable);

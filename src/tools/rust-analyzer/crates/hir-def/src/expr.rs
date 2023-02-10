@@ -12,6 +12,8 @@
 //!
 //! See also a neighboring `body` module.
 
+use std::fmt;
+
 use hir_expand::name::Name;
 use la_arena::{Idx, RawIdx};
 
@@ -34,6 +36,13 @@ pub(crate) fn dummy_expr_id() -> ExprId {
 
 pub type PatId = Idx<Pat>;
 
+#[derive(Debug, Copy, Clone, Hash, PartialEq, Eq)]
+pub enum ExprOrPatId {
+    ExprId(ExprId),
+    PatId(PatId),
+}
+stdx::impl_from!(ExprId, PatId for ExprOrPatId);
+
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub struct Label {
     pub name: Name,
@@ -52,8 +61,8 @@ impl FloatTypeWrapper {
     }
 }
 
-impl std::fmt::Display for FloatTypeWrapper {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl fmt::Display for FloatTypeWrapper {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{:?}", f64::from_bits(self.0))
     }
 }
@@ -135,6 +144,9 @@ pub enum Expr {
     Yield {
         expr: Option<ExprId>,
     },
+    Yeet {
+        expr: Option<ExprId>,
+    },
     RecordLit {
         path: Option<Box<Path>>,
         fields: Box<[RecordLitField]>,
@@ -196,6 +208,7 @@ pub enum Expr {
         arg_types: Box<[Option<Interned<TypeRef>>]>,
         ret_type: Option<Interned<TypeRef>>,
         body: ExprId,
+        closure_kind: ClosureKind,
     },
     Tuple {
         exprs: Box<[ExprId]>,
@@ -204,13 +217,21 @@ pub enum Expr {
     Unsafe {
         body: ExprId,
     },
-    MacroStmts {
-        statements: Box<[Statement]>,
-        tail: Option<ExprId>,
-    },
     Array(Array),
     Literal(Literal),
     Underscore,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ClosureKind {
+    Closure,
+    Generator(Movability),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Movability {
+    Static,
+    Movable,
 }
 
 #[derive(Debug, Clone, Eq, PartialEq)]
@@ -261,7 +282,7 @@ impl Expr {
             Expr::Let { expr, .. } => {
                 f(*expr);
             }
-            Expr::MacroStmts { tail, statements } | Expr::Block { statements, tail, .. } => {
+            Expr::Block { statements, tail, .. } => {
                 for stmt in statements.iter() {
                     match stmt {
                         Statement::Let { initializer, .. } => {
@@ -302,7 +323,10 @@ impl Expr {
                 arms.iter().map(|arm| arm.expr).for_each(f);
             }
             Expr::Continue { .. } => {}
-            Expr::Break { expr, .. } | Expr::Return { expr } | Expr::Yield { expr } => {
+            Expr::Break { expr, .. }
+            | Expr::Return { expr }
+            | Expr::Yield { expr }
+            | Expr::Yeet { expr } => {
                 if let &Some(expr) = expr {
                     f(expr);
                 }

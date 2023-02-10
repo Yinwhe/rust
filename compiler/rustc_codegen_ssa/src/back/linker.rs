@@ -1,6 +1,6 @@
-use super::archive;
 use super::command::Command;
 use super::symbol_export;
+use crate::errors;
 use rustc_span::symbol::sym;
 
 use std::ffi::{OsStr, OsString};
@@ -11,12 +11,13 @@ use std::path::{Path, PathBuf};
 use std::{env, mem, str};
 
 use rustc_hir::def_id::{CrateNum, LOCAL_CRATE};
+use rustc_metadata::find_native_static_library;
 use rustc_middle::middle::dependency_format::Linkage;
 use rustc_middle::middle::exported_symbols::{ExportedSymbol, SymbolExportInfo, SymbolExportKind};
 use rustc_middle::ty::TyCtxt;
 use rustc_session::config::{self, CrateType, DebugInfo, LinkerPluginLto, Lto, OptLevel, Strip};
 use rustc_session::Session;
-use rustc_target::spec::{LinkOutputKind, LinkerFlavor, LldFlavor};
+use rustc_target::spec::{Cc, LinkOutputKind, LinkerFlavor, Lld};
 
 use cc::windows_registry;
 
@@ -33,9 +34,9 @@ pub fn disable_localization(linker: &mut Command) {
     linker.env("VSLANG", "1033");
 }
 
-// The third parameter is for env vars, used on windows to set up the
-// path for MSVC to find its DLLs, and gcc to find its bundled
-// toolchain
+/// The third parameter is for env vars, used on windows to set up the
+/// path for MSVC to find its DLLs, and gcc to find its bundled
+/// toolchain
 pub fn get_linker<'a>(
     sess: &'a Session,
     linker: &Path,
@@ -56,8 +57,13 @@ pub fn get_linker<'a>(
     let mut cmd = match linker.to_str() {
         Some(linker) if cfg!(windows) && linker.ends_with(".bat") => Command::bat_script(linker),
         _ => match flavor {
-            LinkerFlavor::Lld(f) => Command::lld(linker, f),
-            LinkerFlavor::Msvc if sess.opts.cg.linker.is_none() && sess.target.linker.is_none() => {
+            LinkerFlavor::Gnu(Cc::No, Lld::Yes)
+            | LinkerFlavor::Darwin(Cc::No, Lld::Yes)
+            | LinkerFlavor::WasmLld(Cc::No)
+            | LinkerFlavor::Msvc(Lld::Yes) => Command::lld(linker, flavor.lld_flavor()),
+            LinkerFlavor::Msvc(Lld::No)
+                if sess.opts.cg.linker.is_none() && sess.target.linker.is_none() =>
+            {
                 Command::new(msvc_tool.as_ref().map_or(linker, |t| t.path()))
             }
             _ => Command::new(linker),
@@ -68,9 +74,7 @@ pub fn get_linker<'a>(
     // To comply with the Windows App Certification Kit,
     // MSVC needs to link with the Store versions of the runtime libraries (vcruntime, msvcrt, etc).
     let t = &sess.target;
-    if (flavor == LinkerFlavor::Msvc || flavor == LinkerFlavor::Lld(LldFlavor::Link))
-        && t.vendor == "uwp"
-    {
+    if matches!(flavor, LinkerFlavor::Msvc(..)) && t.vendor == "uwp" {
         if let Some(ref tool) = msvc_tool {
             let original_path = tool.path();
             if let Some(ref root_lib_path) = original_path.ancestors().nth(4) {
@@ -104,7 +108,7 @@ pub fn get_linker<'a>(
     if sess.target.is_like_msvc {
         if let Some(ref tool) = msvc_tool {
             cmd.args(tool.args());
-            for &(ref k, ref v) in tool.env() {
+            for (k, v) in tool.env() {
                 if k == "PATH" {
                     new_path.extend(env::split_paths(v));
                     msvc_changed_path = true;
@@ -126,29 +130,25 @@ pub fn get_linker<'a>(
     // to the linker args construction.
     assert!(cmd.get_args().is_empty() || sess.target.vendor == "uwp");
     match flavor {
-        LinkerFlavor::Lld(LldFlavor::Link) | LinkerFlavor::Msvc => {
-            Box::new(MsvcLinker { cmd, sess }) as Box<dyn Linker>
+        LinkerFlavor::Unix(Cc::No) if sess.target.os == "l4re" => {
+            Box::new(L4Bender::new(cmd, sess)) as Box<dyn Linker>
         }
-        LinkerFlavor::Em => Box::new(EmLinker { cmd, sess }) as Box<dyn Linker>,
-        LinkerFlavor::Gcc => {
-            Box::new(GccLinker { cmd, sess, target_cpu, hinted_static: false, is_ld: false })
-                as Box<dyn Linker>
-        }
-
-        LinkerFlavor::Lld(LldFlavor::Ld)
-        | LinkerFlavor::Lld(LldFlavor::Ld64)
-        | LinkerFlavor::Ld => {
-            Box::new(GccLinker { cmd, sess, target_cpu, hinted_static: false, is_ld: true })
-                as Box<dyn Linker>
-        }
-
-        LinkerFlavor::Lld(LldFlavor::Wasm) => Box::new(WasmLd::new(cmd, sess)) as Box<dyn Linker>,
-
-        LinkerFlavor::PtxLinker => Box::new(PtxLinker { cmd, sess }) as Box<dyn Linker>,
-
-        LinkerFlavor::BpfLinker => Box::new(BpfLinker { cmd, sess }) as Box<dyn Linker>,
-
-        LinkerFlavor::L4Bender => Box::new(L4Bender::new(cmd, sess)) as Box<dyn Linker>,
+        LinkerFlavor::WasmLld(Cc::No) => Box::new(WasmLd::new(cmd, sess)) as Box<dyn Linker>,
+        LinkerFlavor::Gnu(cc, _)
+        | LinkerFlavor::Darwin(cc, _)
+        | LinkerFlavor::WasmLld(cc)
+        | LinkerFlavor::Unix(cc) => Box::new(GccLinker {
+            cmd,
+            sess,
+            target_cpu,
+            hinted_static: false,
+            is_ld: cc == Cc::No,
+            is_gnu: flavor.is_gnu(),
+        }) as Box<dyn Linker>,
+        LinkerFlavor::Msvc(..) => Box::new(MsvcLinker { cmd, sess }) as Box<dyn Linker>,
+        LinkerFlavor::EmCc => Box::new(EmLinker { cmd, sess }) as Box<dyn Linker>,
+        LinkerFlavor::Bpf => Box::new(BpfLinker { cmd, sess }) as Box<dyn Linker>,
+        LinkerFlavor::Ptx => Box::new(PtxLinker { cmd, sess }) as Box<dyn Linker>,
     }
 }
 
@@ -186,8 +186,6 @@ pub trait Linker {
     fn no_default_libraries(&mut self);
     fn export_symbols(&mut self, tmpdir: &Path, crate_type: CrateType, symbols: &[String]);
     fn subsystem(&mut self, subsystem: &str);
-    fn group_start(&mut self);
-    fn group_end(&mut self);
     fn linker_plugin_lto(&mut self);
     fn add_eh_frame_header(&mut self) {}
     fn add_no_exec(&mut self) {}
@@ -216,6 +214,7 @@ pub struct GccLinker<'a> {
     hinted_static: bool, // Keeps track of the current hinting mode.
     // Link as ld
     is_ld: bool,
+    is_gnu: bool,
 }
 
 impl<'a> GccLinker<'a> {
@@ -364,7 +363,7 @@ impl<'a> Linker for GccLinker<'a> {
     fn set_output_kind(&mut self, output_kind: LinkOutputKind, out_filename: &Path) {
         match output_kind {
             LinkOutputKind::DynamicNoPicExe => {
-                if !self.is_ld && self.sess.target.linker_is_gnu {
+                if !self.is_ld && self.is_gnu {
                     self.cmd.arg("-no-pie");
                 }
             }
@@ -378,7 +377,7 @@ impl<'a> Linker for GccLinker<'a> {
             LinkOutputKind::StaticNoPicExe => {
                 // `-static` works for both gcc wrapper and ld.
                 self.cmd.arg("-static");
-                if !self.is_ld && self.sess.target.linker_is_gnu {
+                if !self.is_ld && self.is_gnu {
                     self.cmd.arg("-no-pie");
                 }
             }
@@ -436,26 +435,26 @@ impl<'a> Linker for GccLinker<'a> {
                 // FIXME(81490): ld64 doesn't support these flags but macOS 11
                 // has -needed-l{} / -needed_library {}
                 // but we have no way to detect that here.
-                self.sess.warn("`as-needed` modifier not implemented yet for ld64");
-            } else if self.sess.target.linker_is_gnu && !self.sess.target.is_like_windows {
+                self.sess.emit_warning(errors::Ld64UnimplementedModifier);
+            } else if self.is_gnu && !self.sess.target.is_like_windows {
                 self.linker_arg("--no-as-needed");
             } else {
-                self.sess.warn("`as-needed` modifier not supported for current linker");
+                self.sess.emit_warning(errors::LinkerUnsupportedModifier);
             }
         }
         self.hint_dynamic();
-        self.cmd.arg(format!("-l{}{}", if verbatim { ":" } else { "" }, lib));
+        self.cmd.arg(format!("-l{}{lib}", if verbatim && self.is_gnu { ":" } else { "" },));
         if !as_needed {
             if self.sess.target.is_like_osx {
                 // See above FIXME comment
-            } else if self.sess.target.linker_is_gnu && !self.sess.target.is_like_windows {
+            } else if self.is_gnu && !self.sess.target.is_like_windows {
                 self.linker_arg("--as-needed");
             }
         }
     }
     fn link_staticlib(&mut self, lib: &str, verbatim: bool) {
         self.hint_static();
-        self.cmd.arg(format!("-l{}{}", if verbatim { ":" } else { "" }, lib));
+        self.cmd.arg(format!("-l{}{lib}", if verbatim && self.is_gnu { ":" } else { "" },));
     }
     fn link_rlib(&mut self, lib: &Path) {
         self.hint_static();
@@ -494,7 +493,7 @@ impl<'a> Linker for GccLinker<'a> {
             // FIXME(81490): ld64 as of macOS 11 supports the -needed_framework
             // flag but we have no way to detect that here.
             // self.cmd.arg("-needed_framework").arg(framework);
-            self.sess.warn("`as-needed` modifier not implemented yet for ld64");
+            self.sess.emit_warning(errors::Ld64UnimplementedModifier);
         }
         self.cmd.arg("-framework").arg(framework);
     }
@@ -509,17 +508,14 @@ impl<'a> Linker for GccLinker<'a> {
         self.hint_static();
         let target = &self.sess.target;
         if !target.is_like_osx {
-            self.linker_arg("--whole-archive").cmd.arg(format!(
-                "-l{}{}",
-                if verbatim { ":" } else { "" },
-                lib
-            ));
+            self.linker_arg("--whole-archive");
+            self.cmd.arg(format!("-l{}{lib}", if verbatim && self.is_gnu { ":" } else { "" },));
             self.linker_arg("--no-whole-archive");
         } else {
             // -force_load is the macOS equivalent of --whole-archive, but it
             // involves passing the full path to the library to link.
             self.linker_arg("-force_load");
-            let lib = archive::find_library(lib, verbatim, search_path, &self.sess);
+            let lib = find_native_static_library(lib, verbatim, search_path, &self.sess);
             self.linker_arg(&lib);
         }
     }
@@ -548,7 +544,7 @@ impl<'a> Linker for GccLinker<'a> {
         // link times negatively.
         //
         // -dead_strip can't be part of the pre_link_args because it's also used
-        // for partial linking when using multiple codegen units (-r).  So we
+        // for partial linking when using multiple codegen units (-r). So we
         // insert it here.
         if self.sess.target.is_like_osx {
             self.linker_arg("-dead_strip");
@@ -558,21 +554,19 @@ impl<'a> Linker for GccLinker<'a> {
         // eliminate the metadata. If we're building an executable, however,
         // --gc-sections drops the size of hello world from 1.8MB to 597K, a 67%
         // reduction.
-        } else if (self.sess.target.linker_is_gnu || self.sess.target.is_like_wasm)
-            && !keep_metadata
-        {
+        } else if (self.is_gnu || self.sess.target.is_like_wasm) && !keep_metadata {
             self.linker_arg("--gc-sections");
         }
     }
 
     fn no_gc_sections(&mut self) {
-        if self.sess.target.linker_is_gnu || self.sess.target.is_like_wasm {
+        if self.is_gnu || self.sess.target.is_like_wasm {
             self.linker_arg("--no-gc-sections");
         }
     }
 
     fn optimize(&mut self) {
-        if !self.sess.target.linker_is_gnu && !self.sess.target.is_like_wasm {
+        if !self.is_gnu && !self.sess.target.is_like_wasm {
             return;
         }
 
@@ -586,7 +580,7 @@ impl<'a> Linker for GccLinker<'a> {
     }
 
     fn pgo_gen(&mut self) {
-        if !self.sess.target.linker_is_gnu {
+        if !self.is_gnu {
             return;
         }
 
@@ -616,7 +610,13 @@ impl<'a> Linker for GccLinker<'a> {
         match strip {
             Strip::None => {}
             Strip::Debuginfo => {
-                self.linker_arg("--strip-debug");
+                // The illumos linker does not support --strip-debug although
+                // it does support --strip-all as a compatibility alias for -s.
+                // The --strip-debug case is handled by running an external
+                // `strip` utility as a separate step after linking.
+                if self.sess.target.os != "illumos" {
+                    self.linker_arg("--strip-debug");
+                }
             }
             Strip::Symbols => {
                 self.linker_arg("--strip-all");
@@ -672,8 +672,8 @@ impl<'a> Linker for GccLinker<'a> {
                     writeln!(f, "_{}", sym)?;
                 }
             };
-            if let Err(e) = res {
-                self.sess.fatal(&format!("failed to write lib.def file: {}", e));
+            if let Err(error) = res {
+                self.sess.emit_fatal(errors::LibDefWriteFailure { error });
             }
         } else if is_windows {
             let res: io::Result<()> = try {
@@ -687,8 +687,8 @@ impl<'a> Linker for GccLinker<'a> {
                     writeln!(f, "  {}", symbol)?;
                 }
             };
-            if let Err(e) = res {
-                self.sess.fatal(&format!("failed to write list.def file: {}", e));
+            if let Err(error) = res {
+                self.sess.emit_fatal(errors::LibDefWriteFailure { error });
             }
         } else {
             // Write an LD version script
@@ -704,8 +704,8 @@ impl<'a> Linker for GccLinker<'a> {
                 }
                 writeln!(f, "\n  local:\n    *;\n}};")?;
             };
-            if let Err(e) = res {
-                self.sess.fatal(&format!("failed to write version script: {}", e));
+            if let Err(error) = res {
+                self.sess.emit_fatal(errors::VersionScriptWriteFailure { error });
             }
         }
 
@@ -733,18 +733,6 @@ impl<'a> Linker for GccLinker<'a> {
         self.hint_dynamic(); // Reset to default before returning the composed command line.
     }
 
-    fn group_start(&mut self) {
-        if self.takes_hints() {
-            self.linker_arg("--start-group");
-        }
-    }
-
-    fn group_end(&mut self) {
-        if self.takes_hints() {
-            self.linker_arg("--end-group");
-        }
-    }
-
     fn linker_plugin_lto(&mut self) {
         match self.sess.opts.cg.linker_plugin_lto {
             LinkerPluginLto::Disabled => {
@@ -769,13 +757,13 @@ impl<'a> Linker for GccLinker<'a> {
     fn add_no_exec(&mut self) {
         if self.sess.target.is_like_windows {
             self.linker_arg("--nxcompat");
-        } else if self.sess.target.linker_is_gnu {
+        } else if self.is_gnu {
             self.linker_arg("-znoexecstack");
         }
     }
 
     fn add_as_needed(&mut self) {
-        if self.sess.target.linker_is_gnu && !self.sess.target.is_like_windows {
+        if self.is_gnu && !self.sess.target.is_like_windows {
             self.linker_arg("--as-needed");
         } else if self.sess.target.is_like_solaris {
             // -z ignore is the Solaris equivalent to the GNU ld --as-needed option
@@ -934,9 +922,8 @@ impl<'a> Linker for MsvcLinker<'a> {
                                     self.cmd.arg(arg);
                                 }
                             }
-                            Err(err) => {
-                                self.sess
-                                    .warn(&format!("error enumerating natvis directory: {}", err));
+                            Err(error) => {
+                                self.sess.emit_warning(errors::NoNatvisDirectory { error });
                             }
                         }
                     }
@@ -990,8 +977,8 @@ impl<'a> Linker for MsvcLinker<'a> {
                 writeln!(f, "  {}", symbol)?;
             }
         };
-        if let Err(e) = res {
-            self.sess.fatal(&format!("failed to write lib.def file: {}", e));
+        if let Err(error) = res {
+            self.sess.emit_fatal(errors::LibDefWriteFailure { error });
         }
         let mut arg = OsString::from("/DEF:");
         arg.push(path);
@@ -1021,10 +1008,6 @@ impl<'a> Linker for MsvcLinker<'a> {
             self.cmd.arg("/ENTRY:mainCRTStartup");
         }
     }
-
-    // MSVC doesn't need group indicators
-    fn group_start(&mut self) {}
-    fn group_end(&mut self) {}
 
     fn linker_plugin_lto(&mut self) {
         // Do nothing
@@ -1168,10 +1151,6 @@ impl<'a> Linker for EmLinker<'a> {
         // noop
     }
 
-    // Appears not necessary on Emscripten
-    fn group_start(&mut self) {}
-    fn group_end(&mut self) {}
-
     fn linker_plugin_lto(&mut self) {
         // Do nothing
     }
@@ -1199,22 +1178,19 @@ impl<'a> WasmLd<'a> {
         //   sharing memory and instantiating the module multiple times. As a
         //   result if it were exported then we'd just have no sharing.
         //
-        // * `--export=__wasm_init_memory` - when using `--passive-segments` the
-        //   linker will synthesize this function, and so we need to make sure
-        //   that our usage of `--export` below won't accidentally cause this
-        //   function to get deleted.
-        //
-        // * `--export=*tls*` - when `#[thread_local]` symbols are used these
-        //   symbols are how the TLS segments are initialized and configured.
+        // On wasm32-unknown-unknown, we also export symbols for glue code to use:
+        //    * `--export=*tls*` - when `#[thread_local]` symbols are used these
+        //      symbols are how the TLS segments are initialized and configured.
         if sess.target_features.contains(&sym::atomics) {
             cmd.arg("--shared-memory");
             cmd.arg("--max-memory=1073741824");
             cmd.arg("--import-memory");
-            cmd.arg("--export=__wasm_init_memory");
-            cmd.arg("--export=__wasm_init_tls");
-            cmd.arg("--export=__tls_size");
-            cmd.arg("--export=__tls_align");
-            cmd.arg("--export=__tls_base");
+            if sess.target.os == "unknown" {
+                cmd.arg("--export=__wasm_init_tls");
+                cmd.arg("--export=__tls_size");
+                cmd.arg("--export=__tls_align");
+                cmd.arg("--export=__tls_base");
+            }
         }
         WasmLd { cmd, sess }
     }
@@ -1284,11 +1260,11 @@ impl<'a> Linker for WasmLd<'a> {
     }
 
     fn link_whole_staticlib(&mut self, lib: &str, _verbatim: bool, _search_path: &[PathBuf]) {
-        self.cmd.arg("-l").arg(lib);
+        self.cmd.arg("--whole-archive").arg("-l").arg(lib).arg("--no-whole-archive");
     }
 
     fn link_whole_rlib(&mut self, lib: &Path) {
-        self.cmd.arg(lib);
+        self.cmd.arg("--whole-archive").arg(lib).arg("--no-whole-archive");
     }
 
     fn gc_sections(&mut self, _keep_metadata: bool) {
@@ -1339,17 +1315,15 @@ impl<'a> Linker for WasmLd<'a> {
 
         // LLD will hide these otherwise-internal symbols since it only exports
         // symbols explicitly passed via the `--export` flags above and hides all
-        // others. Various bits and pieces of tooling use this, so be sure these
-        // symbols make their way out of the linker as well.
-        self.cmd.arg("--export=__heap_base");
-        self.cmd.arg("--export=__data_end");
+        // others. Various bits and pieces of wasm32-unknown-unknown tooling use
+        // this, so be sure these symbols make their way out of the linker as well.
+        if self.sess.target.os == "unknown" {
+            self.cmd.arg("--export=__heap_base");
+            self.cmd.arg("--export=__data_end");
+        }
     }
 
     fn subsystem(&mut self, _subsystem: &str) {}
-
-    // Not needed for now with LLD
-    fn group_start(&mut self) {}
-    fn group_end(&mut self) {}
 
     fn linker_plugin_lto(&mut self) {
         // Do nothing for now
@@ -1467,7 +1441,7 @@ impl<'a> Linker for L4Bender<'a> {
 
     fn export_symbols(&mut self, _: &Path, _: CrateType, _: &[String]) {
         // ToDo, not implemented, copy from GCC
-        self.sess.warn("exporting symbols not implemented yet for L4Bender");
+        self.sess.emit_warning(errors::L4BenderExportingSymbolsUnimplemented);
         return;
     }
 
@@ -1477,14 +1451,6 @@ impl<'a> Linker for L4Bender<'a> {
 
     fn reset_per_library_state(&mut self) {
         self.hint_static(); // Reset to default before returning the composed command line.
-    }
-
-    fn group_start(&mut self) {
-        self.cmd.arg("--start-group");
-    }
-
-    fn group_end(&mut self) {
-        self.cmd.arg("--end-group");
     }
 
     fn linker_plugin_lto(&mut self) {}
@@ -1667,10 +1633,6 @@ impl<'a> Linker for PtxLinker<'a> {
 
     fn subsystem(&mut self, _subsystem: &str) {}
 
-    fn group_start(&mut self) {}
-
-    fn group_end(&mut self) {}
-
     fn linker_plugin_lto(&mut self) {}
 }
 
@@ -1771,18 +1733,14 @@ impl<'a> Linker for BpfLinker<'a> {
                 writeln!(f, "{}", sym)?;
             }
         };
-        if let Err(e) = res {
-            self.sess.fatal(&format!("failed to write symbols file: {}", e));
+        if let Err(error) = res {
+            self.sess.emit_fatal(errors::SymbolFileWriteFailure { error });
         } else {
             self.cmd.arg("--export-symbols").arg(&path);
         }
     }
 
     fn subsystem(&mut self, _subsystem: &str) {}
-
-    fn group_start(&mut self) {}
-
-    fn group_end(&mut self) {}
 
     fn linker_plugin_lto(&mut self) {}
 }

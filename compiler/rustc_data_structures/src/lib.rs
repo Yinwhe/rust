@@ -11,9 +11,8 @@
 #![feature(associated_type_bounds)]
 #![feature(auto_traits)]
 #![feature(cell_leak)]
-#![feature(control_flow_enum)]
+#![feature(core_intrinsics)]
 #![feature(extend_one)]
-#![feature(let_else)]
 #![feature(hash_raw_entry)]
 #![feature(hasher_prefixfree_extras)]
 #![feature(maybe_uninit_uninit_array)]
@@ -23,11 +22,14 @@
 #![feature(new_uninit)]
 #![feature(once_cell)]
 #![feature(rustc_attrs)]
+#![feature(negative_impls)]
 #![feature(test)]
 #![feature(thread_id_value)]
 #![feature(vec_into_raw_parts)]
 #![allow(rustc::default_hash_types)]
 #![allow(rustc::potential_query_instability)]
+#![deny(rustc::untranslatable_diagnostic)]
+#![deny(rustc::diagnostic_outside_of_impl)]
 
 #[macro_use]
 extern crate tracing;
@@ -73,7 +75,6 @@ pub mod profiling;
 pub mod sharded;
 pub mod stack;
 pub mod sync;
-pub mod thin_vec;
 pub mod tiny_list;
 pub mod transitive_relation;
 pub mod vec_linked_list;
@@ -86,6 +87,7 @@ pub mod steal;
 pub mod tagged_ptr;
 pub mod temp_dir;
 pub mod unhash;
+pub mod unord;
 
 pub use ena::undo_log;
 pub use ena::unify;

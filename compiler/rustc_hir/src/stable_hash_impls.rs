@@ -20,7 +20,7 @@ impl<HirCtx: crate::HashStableContext> ToStableHashKey<HirCtx> for HirId {
 
     #[inline]
     fn to_stable_hash_key(&self, hcx: &HirCtx) -> (DefPathHash, ItemLocalId) {
-        let def_path_hash = self.owner.to_stable_hash_key(hcx);
+        let def_path_hash = self.owner.def_id.to_stable_hash_key(hcx);
         (def_path_hash, self.local_id)
     }
 }
@@ -49,7 +49,7 @@ impl<HirCtx: crate::HashStableContext> ToStableHashKey<HirCtx> for ItemId {
 
     #[inline]
     fn to_stable_hash_key(&self, hcx: &HirCtx) -> DefPathHash {
-        self.def_id.to_stable_hash_key(hcx)
+        self.owner_id.def_id.to_stable_hash_key(hcx)
     }
 }
 
@@ -58,7 +58,7 @@ impl<HirCtx: crate::HashStableContext> ToStableHashKey<HirCtx> for TraitItemId {
 
     #[inline]
     fn to_stable_hash_key(&self, hcx: &HirCtx) -> DefPathHash {
-        self.def_id.to_stable_hash_key(hcx)
+        self.owner_id.def_id.to_stable_hash_key(hcx)
     }
 }
 
@@ -67,7 +67,7 @@ impl<HirCtx: crate::HashStableContext> ToStableHashKey<HirCtx> for ImplItemId {
 
     #[inline]
     fn to_stable_hash_key(&self, hcx: &HirCtx) -> DefPathHash {
-        self.def_id.to_stable_hash_key(hcx)
+        self.owner_id.def_id.to_stable_hash_key(hcx)
     }
 }
 
@@ -76,7 +76,7 @@ impl<HirCtx: crate::HashStableContext> ToStableHashKey<HirCtx> for ForeignItemId
 
     #[inline]
     fn to_stable_hash_key(&self, hcx: &HirCtx) -> DefPathHash {
-        self.def_id.to_stable_hash_key(hcx)
+        self.owner_id.def_id.to_stable_hash_key(hcx)
     }
 }
 
@@ -100,13 +100,8 @@ impl<'tcx, HirCtx: crate::HashStableContext> HashStable<HirCtx> for OwnerNodes<'
         // `local_id_to_def_id` is also ignored because is dependent on the body, then just hashing
         // the body satisfies the condition of two nodes being different have different
         // `hash_stable` results.
-        let OwnerNodes {
-            hash_including_bodies,
-            hash_without_bodies: _,
-            nodes: _,
-            bodies: _,
-            local_id_to_def_id: _,
-        } = *self;
+        let OwnerNodes { hash_including_bodies, hash_without_bodies: _, nodes: _, bodies: _ } =
+            *self;
         hash_including_bodies.hash_stable(hcx, hasher);
     }
 }

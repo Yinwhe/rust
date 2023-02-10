@@ -9,17 +9,20 @@ The tracking issues for this feature are:
 
 This feature allows for use of one of following sanitizers:
 
-* [AddressSanitizer][clang-asan] a fast memory error detector.
-* [ControlFlowIntegrity][clang-cfi] LLVM Control Flow Integrity (CFI) provides
+* [AddressSanitizer](#addresssanitizer) a fast memory error detector.
+* [ControlFlowIntegrity](#controlflowintegrity) LLVM Control Flow Integrity (CFI) provides
   forward-edge control flow protection.
-* [HWAddressSanitizer][clang-hwasan] a memory error detector similar to
+* [HWAddressSanitizer](#hwaddresssanitizer) a memory error detector similar to
   AddressSanitizer, but based on partial hardware assistance.
-* [LeakSanitizer][clang-lsan] a run-time memory leak detector.
-* [MemorySanitizer][clang-msan] a detector of uninitialized reads.
-* [MemTagSanitizer][clang-memtag] fast memory error detector based on
+* [KernelControlFlowIntegrity](#kernelcontrolflowintegrity) LLVM Kernel Control
+  Flow Integrity (KCFI) provides forward-edge control flow protection for
+  operating systems kernels.
+* [LeakSanitizer](#leaksanitizer) a run-time memory leak detector.
+* [MemorySanitizer](#memorysanitizer) a detector of uninitialized reads.
+* [MemTagSanitizer](#memtagsanitizer) fast memory error detector based on
   Armv8.5-A Memory Tagging Extension.
-* [ShadowCallStack][clang-scs] provides backward-edge control flow protection.
-* [ThreadSanitizer][clang-tsan] a fast data race detector.
+* [ShadowCallStack](#shadowcallstack) provides backward-edge control flow protection.
+* [ThreadSanitizer](#threadsanitizer) a fast data race detector.
 
 To enable a sanitizer compile with `-Zsanitizer=address`,`-Zsanitizer=cfi`,
 `-Zsanitizer=hwaddress`, `-Zsanitizer=leak`, `-Zsanitizer=memory`,
@@ -47,16 +50,18 @@ with runtime flag `ASAN_OPTIONS=detect_leaks=1` on macOS.
 AddressSanitizer is supported on the following targets:
 
 * `aarch64-apple-darwin`
-* `aarch64-fuchsia`
+* `aarch64-unknown-fuchsia`
 * `aarch64-unknown-linux-gnu`
 * `x86_64-apple-darwin`
-* `x86_64-fuchsia`
+* `x86_64-unknown-fuchsia`
 * `x86_64-unknown-freebsd`
 * `x86_64-unknown-linux-gnu`
 
 AddressSanitizer works with non-instrumented code although it will impede its
 ability to detect some bugs.  It is not expected to produce false positive
 reports.
+
+See the [Clang AddressSanitizer documentation][clang-asan] for more details.
 
 ## Examples
 
@@ -203,6 +208,8 @@ compatible type identifiers (see Type metadata in the design document in the
 tracking issue [#89653](https://github.com/rust-lang/rust/issues/89653)).
 
 LLVM CFI can be enabled with -Zsanitizer=cfi and requires LTO (i.e., -Clto).
+
+See the [Clang ControlFlowIntegrity documentation][clang-cfi] for more details.
 
 ## Example
 
@@ -413,8 +420,8 @@ flow using an indirect branch/call to a function with different return and
 parameter types than the return type expected and arguments intended/passed in
 the call/branch site, the execution is also terminated (see Fig. 9).
 
-[rust-book-ch19-05]: https://doc.rust-lang.org/book/ch19-05-advanced-functions-and-closures.html
-[rust-book]: https://doc.rust-lang.org/book/title-page.html
+[rust-book-ch19-05]: ../../book/ch19-05-advanced-functions-and-closures.html
+[rust-book]: ../../book/title-page.html
 
 # HWAddressSanitizer
 
@@ -429,6 +436,8 @@ HWAddressSanitizer is supported on the following targets:
 HWAddressSanitizer requires `tagged-globals` target feature to instrument
 globals. To enable this target feature compile with `-C
 target-feature=+tagged-globals`
+
+See the [Clang HWAddressSanitizer documentation][clang-hwasan] for more details.
 
 ## Example
 
@@ -496,6 +505,32 @@ Registers where the failure occurred (pc 0xaaaae0ae4a98):
 SUMMARY: HWAddressSanitizer: tag-mismatch (/.../main+0x54a94)
 ```
 
+# KernelControlFlowIntegrity
+
+The LLVM Kernel Control Flow Integrity (CFI) support to the Rust compiler
+initially provides forward-edge control flow protection for operating systems
+kernels for Rust-compiled code only by aggregating function pointers in groups
+identified by their return and parameter types. (See [LLVM commit cff5bef "KCFI
+sanitizer"](https://github.com/llvm/llvm-project/commit/cff5bef948c91e4919de8a5fb9765e0edc13f3de).)
+
+Forward-edge control flow protection for C or C++ and Rust -compiled code "mixed
+binaries" (i.e., for when C or C++ and Rust -compiled code share the same
+virtual address space) will be provided in later work by defining and using
+compatible type identifiers (see Type metadata in the design document in the
+tracking issue [#89653](https://github.com/rust-lang/rust/issues/89653)).
+
+LLVM KCFI can be enabled with `-Zsanitizer=kcfi`.
+
+LLVM KCFI is supported on the following targets:
+
+* `aarch64-linux-android`
+* `aarch64-unknown-linux-gnu`
+* `x86_64-linux-android`
+* `x86_64-unknown-linux-gnu`
+
+See the [Clang KernelControlFlowIntegrity documentation][clang-kcfi] for more
+details.
+
 # LeakSanitizer
 
 LeakSanitizer is run-time memory leak detector.
@@ -506,6 +541,8 @@ LeakSanitizer is supported on the following targets:
 * `aarch64-unknown-linux-gnu`
 * `x86_64-apple-darwin`
 * `x86_64-unknown-linux-gnu`
+
+See the [Clang LeakSanitizer documentation][clang-lsan] for more details.
 
 # MemorySanitizer
 
@@ -520,6 +557,8 @@ MemorySanitizer is supported on the following targets:
 MemorySanitizer requires all program code to be instrumented. C/C++ dependencies
 need to be recompiled using Clang with `-fsanitize=memory` option. Failing to
 achieve that will result in false positive reports.
+
+See the [Clang MemorySanitizer documentation][clang-msan] for more details.
 
 ## Example
 
@@ -569,7 +608,7 @@ MemTagSanitizer is supported on the following targets:
 MemTagSanitizer requires hardware support and the `mte` target feature.
 To enable this target feature compile with `-C target-feature="+mte"`.
 
-More information can be found in the associated [LLVM documentation](https://llvm.org/docs/MemTagSanitizer.html).
+See the [LLVM MemTagSanitizer documentation][llvm-memtag] for more details.
 
 # ShadowCallStack
 
@@ -581,7 +620,9 @@ ShadowCallStack can be enabled with `-Zsanitizer=shadow-call-stack` option and i
 
 * `aarch64-linux-android`
 
-A runtime must be provided by the application or operating system. See the [LLVM documentation][clang-scs] for further details.
+A runtime must be provided by the application or operating system.
+
+See the [Clang ShadowCallStack documentation][clang-scs] for more details.
 
 # ThreadSanitizer
 
@@ -603,6 +644,8 @@ can lead to false positive reports.
 
 ThreadSanitizer does not support atomic fences `std::sync::atomic::fence`,
 nor synchronization performed using inline assembly code.
+
+See the [Clang ThreadSanitizer documentation][clang-tsan] for more details.
 
 ## Example
 
@@ -648,7 +691,7 @@ It is strongly recommended to combine sanitizers with recompiled and
 instrumented standard library, for example using [cargo `-Zbuild-std`
 functionality][build-std].
 
-[build-std]: https://doc.rust-lang.org/nightly/cargo/reference/unstable.html#build-std
+[build-std]: ../../cargo/reference/unstable.html#build-std
 
 # Build scripts and procedural macros
 
@@ -673,12 +716,15 @@ Sanitizers produce symbolized stacktraces when llvm-symbolizer binary is in `PAT
 * [HWAddressSanitizer in Clang][clang-hwasan]
 * [LeakSanitizer in Clang][clang-lsan]
 * [MemorySanitizer in Clang][clang-msan]
+* [MemTagSanitizer in LLVM][llvm-memtag]
 * [ThreadSanitizer in Clang][clang-tsan]
 
 [clang-asan]: https://clang.llvm.org/docs/AddressSanitizer.html
 [clang-cfi]: https://clang.llvm.org/docs/ControlFlowIntegrity.html
 [clang-hwasan]: https://clang.llvm.org/docs/HardwareAssistedAddressSanitizerDesign.html
+[clang-kcfi]: https://clang.llvm.org/docs/ControlFlowIntegrity.html#fsanitize-kcfi
 [clang-lsan]: https://clang.llvm.org/docs/LeakSanitizer.html
 [clang-msan]: https://clang.llvm.org/docs/MemorySanitizer.html
 [clang-scs]: https://clang.llvm.org/docs/ShadowCallStack.html
 [clang-tsan]: https://clang.llvm.org/docs/ThreadSanitizer.html
+[llvm-memtag]: https://llvm.org/docs/MemTagSanitizer.html

@@ -6,23 +6,27 @@ use rustc_middle::bug;
 use rustc_middle::ty;
 use rustc_session::lint::builtin::PROC_MACRO_DERIVE_RESOLUTION_FALLBACK;
 use rustc_session::lint::BuiltinLintDiagnostics;
-use rustc_span::edition::Edition;
+use rustc_span::def_id::LocalDefId;
 use rustc_span::hygiene::{ExpnId, ExpnKind, LocalExpnId, MacroKind, SyntaxContext};
 use rustc_span::symbol::{kw, Ident};
 use rustc_span::{Span, DUMMY_SP};
 
 use std::ptr;
 
-use crate::late::{ConstantItemKind, HasGenericParams, PathSource, Rib, RibKind};
+use crate::late::{
+    ConstantHasGenerics, ConstantItemKind, HasGenericParams, PathSource, Rib, RibKind,
+};
 use crate::macros::{sub_namespace_match, MacroRulesScope};
 use crate::{AmbiguityError, AmbiguityErrorMisc, AmbiguityKind, Determinacy, Finalize};
-use crate::{ImportKind, LexicalScopeBinding, Module, ModuleKind, ModuleOrUniformRoot};
+use crate::{Import, ImportKind, LexicalScopeBinding, Module, ModuleKind, ModuleOrUniformRoot};
 use crate::{NameBinding, NameBindingKind, ParentScope, PathResult, PrivacyError, Res};
 use crate::{ResolutionError, Resolver, Scope, ScopeSet, Segment, ToNameBinding, Weak};
 
 use Determinacy::*;
 use Namespace::*;
 use RibKind::*;
+
+type Visibility = ty::Visibility<LocalDefId>;
 
 impl<'a> Resolver<'a> {
     /// A generic scope visitor.
@@ -81,7 +85,7 @@ impl<'a> Resolver<'a> {
         // 4c. Standard library prelude (de-facto closed, controlled).
         // 6. Language prelude: builtin attributes (closed, controlled).
 
-        let rust_2015 = ctxt.edition() == Edition::Edition2015;
+        let rust_2015 = ctxt.edition().is_rust_2015();
         let (ns, macro_kind, is_absolute_path) = match scope_set {
             ScopeSet::All(ns, _) => (ns, None, false),
             ScopeSet::AbsolutePath(ns) => (ns, None, true),
@@ -125,7 +129,6 @@ impl<'a> Resolver<'a> {
                 }
                 Scope::CrateRoot => true,
                 Scope::Module(..) => true,
-                Scope::RegisteredAttrs => use_prelude,
                 Scope::MacroUsePrelude => use_prelude || rust_2015,
                 Scope::BuiltinAttrs => true,
                 Scope::ExternPrelude => use_prelude || is_absolute_path,
@@ -185,12 +188,11 @@ impl<'a> Resolver<'a> {
                             match ns {
                                 TypeNS => Scope::ExternPrelude,
                                 ValueNS => Scope::StdLibPrelude,
-                                MacroNS => Scope::RegisteredAttrs,
+                                MacroNS => Scope::MacroUsePrelude,
                             }
                         }
                     }
                 }
-                Scope::RegisteredAttrs => Scope::MacroUsePrelude,
                 Scope::MacroUsePrelude => Scope::StdLibPrelude,
                 Scope::BuiltinAttrs => break, // nowhere else to search
                 Scope::ExternPrelude if is_absolute_path => break,
@@ -273,7 +275,7 @@ impl<'a> Resolver<'a> {
     ///
     /// Invariant: This must only be called during main resolution, not during
     /// import resolution.
-    #[tracing::instrument(level = "debug", skip(self, ribs))]
+    #[instrument(level = "debug", skip(self, ribs))]
     pub(crate) fn resolve_ident_in_lexical_scope(
         &mut self,
         mut ident: Ident,
@@ -367,7 +369,7 @@ impl<'a> Resolver<'a> {
     /// expansion and import resolution (perhaps they can be merged in the future).
     /// The function is used for resolving initial segments of macro paths (e.g., `foo` in
     /// `foo::bar!(); or `foo!();`) and also for import paths on 2018 edition.
-    #[tracing::instrument(level = "debug", skip(self, scope_set))]
+    #[instrument(level = "debug", skip(self, scope_set))]
     pub(crate) fn early_resolve_ident_in_lexical_scope(
         &mut self,
         orig_ident: Ident,
@@ -424,8 +426,7 @@ impl<'a> Resolver<'a> {
                 let ident = Ident::new(orig_ident.name, orig_ident.span.with_ctxt(ctxt));
                 let ok = |res, span, arenas| {
                     Ok((
-                        (res, ty::Visibility::Public, span, LocalExpnId::ROOT)
-                            .to_name_binding(arenas),
+                        (res, Visibility::Public, span, LocalExpnId::ROOT).to_name_binding(arenas),
                         Flags::empty(),
                     ))
                 };
@@ -438,7 +439,7 @@ impl<'a> Resolver<'a> {
                         {
                             let binding = (
                                 Res::NonMacroAttr(NonMacroAttrKind::DeriveHelper),
-                                ty::Visibility::Public,
+                                Visibility::Public,
                                 attr.span,
                                 expn_id,
                             )
@@ -554,14 +555,6 @@ impl<'a> Resolver<'a> {
                             Err((Determinacy::Determined, _)) => Err(Determinacy::Determined),
                         }
                     }
-                    Scope::RegisteredAttrs => match this.registered_attrs.get(&ident).cloned() {
-                        Some(ident) => ok(
-                            Res::NonMacroAttr(NonMacroAttrKind::Registered),
-                            ident.span,
-                            this.arenas,
-                        ),
-                        None => Err(Determinacy::Determined),
-                    },
                     Scope::MacroUsePrelude => {
                         match this.macro_use_prelude.get(&ident.name).cloned() {
                             Some(binding) => Ok((binding, Flags::MISC_FROM_PRELUDE)),
@@ -716,7 +709,7 @@ impl<'a> Resolver<'a> {
         Err(Determinacy::determined(determinacy == Determinacy::Determined || force))
     }
 
-    #[tracing::instrument(level = "debug", skip(self))]
+    #[instrument(level = "debug", skip(self))]
     pub(crate) fn maybe_resolve_ident_in_module(
         &mut self,
         module: ModuleOrUniformRoot<'a>,
@@ -728,7 +721,7 @@ impl<'a> Resolver<'a> {
             .map_err(|(determinacy, _)| determinacy)
     }
 
-    #[tracing::instrument(level = "debug", skip(self))]
+    #[instrument(level = "debug", skip(self))]
     pub(crate) fn resolve_ident_in_module(
         &mut self,
         module: ModuleOrUniformRoot<'a>,
@@ -742,7 +735,7 @@ impl<'a> Resolver<'a> {
             .map_err(|(determinacy, _)| determinacy)
     }
 
-    #[tracing::instrument(level = "debug", skip(self))]
+    #[instrument(level = "debug", skip(self))]
     fn resolve_ident_in_module_ext(
         &mut self,
         module: ModuleOrUniformRoot<'a>,
@@ -780,7 +773,7 @@ impl<'a> Resolver<'a> {
         )
     }
 
-    #[tracing::instrument(level = "debug", skip(self))]
+    #[instrument(level = "debug", skip(self))]
     fn resolve_ident_in_module_unadjusted(
         &mut self,
         module: ModuleOrUniformRoot<'a>,
@@ -804,7 +797,7 @@ impl<'a> Resolver<'a> {
 
     /// Attempts to resolve `ident` in namespaces `ns` of `module`.
     /// Invariant: if `finalize` is `Some`, expansion and import resolution must be complete.
-    #[tracing::instrument(level = "debug", skip(self))]
+    #[instrument(level = "debug", skip(self))]
     fn resolve_ident_in_module_unadjusted_ext(
         &mut self,
         module: ModuleOrUniformRoot<'a>,
@@ -849,9 +842,8 @@ impl<'a> Resolver<'a> {
                 if ns == TypeNS {
                     if ident.name == kw::Crate || ident.name == kw::DollarCrate {
                         let module = self.resolve_crate_root(ident);
-                        let binding =
-                            (module, ty::Visibility::Public, module.span, LocalExpnId::ROOT)
-                                .to_name_binding(self.arenas);
+                        let binding = (module, Visibility::Public, module.span, LocalExpnId::ROOT)
+                            .to_name_binding(self.arenas);
                         return Ok(binding);
                     } else if ident.name == kw::Super || ident.name == kw::SelfLower {
                         // FIXME: Implement these with renaming requirements so that e.g.
@@ -882,13 +874,12 @@ impl<'a> Resolver<'a> {
             // binding if it exists. What we really want here is having two separate scopes in
             // a module - one for non-globs and one for globs, but until that's done use this
             // hack to avoid inconsistent resolution ICEs during import validation.
-            let binding = [resolution.binding, resolution.shadowed_glob]
-                .into_iter()
-                .filter_map(|binding| match (binding, ignore_binding) {
+            let binding = [resolution.binding, resolution.shadowed_glob].into_iter().find_map(
+                |binding| match (binding, ignore_binding) {
                     (Some(binding), Some(ignored)) if ptr::eq(binding, ignored) => None,
                     _ => binding,
-                })
-                .next();
+                },
+            );
             let Some(binding) = binding else {
                 return Err((Determined, Weak::No));
             };
@@ -922,7 +913,11 @@ impl<'a> Resolver<'a> {
             }
 
             if !restricted_shadowing && binding.expansion != LocalExpnId::ROOT {
-                if let NameBindingKind::Res(_, true) = binding.kind {
+                if let NameBindingKind::Import {
+                    import: Import { kind: ImportKind::MacroExport, .. },
+                    ..
+                } = binding.kind
+                {
                     self.macro_expanded_macro_export_errors.insert((path_span, binding.span));
                 }
             }
@@ -951,7 +946,10 @@ impl<'a> Resolver<'a> {
         // Check if one of single imports can still define the name,
         // if it can then our result is not determined and can be invalidated.
         for single_import in &resolution.single_imports {
-            if !self.is_accessible_from(single_import.vis.get(), parent_scope.module) {
+            let Some(import_vis) = single_import.vis.get() else {
+                continue;
+            };
+            if !self.is_accessible_from(import_vis, parent_scope.module) {
                 continue;
             }
             let Some(module) = single_import.imported_module.get() else {
@@ -1016,7 +1014,10 @@ impl<'a> Resolver<'a> {
         // Check if one of glob imports can still define the name,
         // if it can then our "no resolution" result is not determined and can be invalidated.
         for glob_import in module.globs.borrow().iter() {
-            if !self.is_accessible_from(glob_import.vis.get(), parent_scope.module) {
+            let Some(import_vis) = glob_import.vis.get() else {
+                continue;
+            };
+            if !self.is_accessible_from(import_vis, parent_scope.module) {
                 continue;
             }
             let module = match glob_import.imported_module.get() {
@@ -1061,7 +1062,7 @@ impl<'a> Resolver<'a> {
     }
 
     /// Validate a local resolution (from ribs).
-    #[tracing::instrument(level = "debug", skip(self, all_ribs))]
+    #[instrument(level = "debug", skip(self, all_ribs))]
     fn validate_res_from_ribs(
         &mut self,
         rib_index: usize,
@@ -1103,7 +1104,7 @@ impl<'a> Resolver<'a> {
                         | ForwardGenericParamBanRibKind => {
                             // Nothing to do. Continue.
                         }
-                        ItemRibKind(_) | FnItemRibKind | AssocItemRibKind => {
+                        ItemRibKind(_) | AssocItemRibKind => {
                             // This was an attempt to access an upvar inside a
                             // named function item. This is not allowed, so we
                             // report an error.
@@ -1163,15 +1164,15 @@ impl<'a> Resolver<'a> {
                     return Res::Err;
                 }
             }
-            Res::Def(DefKind::TyParam, _) | Res::SelfTy { .. } => {
+            Res::Def(DefKind::TyParam, _) | Res::SelfTyParam { .. } | Res::SelfTyAlias { .. } => {
                 for rib in ribs {
                     let has_generic_params: HasGenericParams = match rib.kind {
                         NormalRibKind
                         | ClosureOrAsyncRibKind
-                        | AssocItemRibKind
                         | ModuleRibKind(..)
                         | MacroDefinition(..)
                         | InlineAsmSymRibKind
+                        | AssocItemRibKind
                         | ForwardGenericParamBanRibKind => {
                             // Nothing to do. Continue.
                             continue;
@@ -1180,12 +1181,24 @@ impl<'a> Resolver<'a> {
                         ConstantItemRibKind(trivial, _) => {
                             let features = self.session.features_untracked();
                             // HACK(min_const_generics): We currently only allow `N` or `{ N }`.
-                            if !(trivial == HasGenericParams::Yes || features.generic_const_exprs) {
-                                // HACK(min_const_generics): If we encounter `Self` in an anonymous constant
-                                // we can't easily tell if it's generic at this stage, so we instead remember
-                                // this and then enforce the self type to be concrete later on.
-                                if let Res::SelfTy { trait_, alias_to: Some((def, _)) } = res {
-                                    res = Res::SelfTy { trait_, alias_to: Some((def, true)) }
+                            if !(trivial == ConstantHasGenerics::Yes
+                                || features.generic_const_exprs)
+                            {
+                                // HACK(min_const_generics): If we encounter `Self` in an anonymous
+                                // constant we can't easily tell if it's generic at this stage, so
+                                // we instead remember this and then enforce the self type to be
+                                // concrete later on.
+                                if let Res::SelfTyAlias {
+                                    alias_to: def,
+                                    forbid_generic: _,
+                                    is_trait_impl,
+                                } = res
+                                {
+                                    res = Res::SelfTyAlias {
+                                        alias_to: def,
+                                        forbid_generic: true,
+                                        is_trait_impl,
+                                    }
                                 } else {
                                     if let Some(span) = finalize {
                                         self.report_error(
@@ -1207,7 +1220,6 @@ impl<'a> Resolver<'a> {
 
                         // This was an attempt to use a type parameter outside its scope.
                         ItemRibKind(has_generic_params) => has_generic_params,
-                        FnItemRibKind => HasGenericParams::Yes,
                         ConstParamTyRibKind => {
                             if let Some(span) = finalize {
                                 self.report_error(
@@ -1232,28 +1244,22 @@ impl<'a> Resolver<'a> {
                 }
             }
             Res::Def(DefKind::ConstParam, _) => {
-                let mut ribs = ribs.iter().peekable();
-                if let Some(Rib { kind: FnItemRibKind, .. }) = ribs.peek() {
-                    // When declaring const parameters inside function signatures, the first rib
-                    // is always a `FnItemRibKind`. In this case, we can skip it, to avoid it
-                    // (spuriously) conflicting with the const param.
-                    ribs.next();
-                }
-
                 for rib in ribs {
                     let has_generic_params = match rib.kind {
                         NormalRibKind
                         | ClosureOrAsyncRibKind
-                        | AssocItemRibKind
                         | ModuleRibKind(..)
                         | MacroDefinition(..)
                         | InlineAsmSymRibKind
+                        | AssocItemRibKind
                         | ForwardGenericParamBanRibKind => continue,
 
                         ConstantItemRibKind(trivial, _) => {
                             let features = self.session.features_untracked();
                             // HACK(min_const_generics): We currently only allow `N` or `{ N }`.
-                            if !(trivial == HasGenericParams::Yes || features.generic_const_exprs) {
+                            if !(trivial == ConstantHasGenerics::Yes
+                                || features.generic_const_exprs)
+                            {
                                 if let Some(span) = finalize {
                                     self.report_error(
                                         span,
@@ -1272,7 +1278,6 @@ impl<'a> Resolver<'a> {
                         }
 
                         ItemRibKind(has_generic_params) => has_generic_params,
-                        FnItemRibKind => HasGenericParams::Yes,
                         ConstParamTyRibKind => {
                             if let Some(span) = finalize {
                                 self.report_error(
@@ -1302,7 +1307,7 @@ impl<'a> Resolver<'a> {
         res
     }
 
-    #[tracing::instrument(level = "debug", skip(self))]
+    #[instrument(level = "debug", skip(self))]
     pub(crate) fn maybe_resolve_path(
         &mut self,
         path: &[Segment],
@@ -1312,7 +1317,7 @@ impl<'a> Resolver<'a> {
         self.resolve_path_with_ribs(path, opt_ns, parent_scope, None, None, None)
     }
 
-    #[tracing::instrument(level = "debug", skip(self))]
+    #[instrument(level = "debug", skip(self))]
     pub(crate) fn resolve_path(
         &mut self,
         path: &[Segment],
@@ -1392,7 +1397,8 @@ impl<'a> Resolver<'a> {
                         module = Some(ModuleOrUniformRoot::ExternPrelude);
                         continue;
                     }
-                    if name == kw::PathRoot && ident.span.rust_2015() && self.session.rust_2018() {
+                    if name == kw::PathRoot && ident.span.is_rust_2015() && self.session.rust_2018()
+                    {
                         // `::a::b` from 2015 macro on 2018 global edition
                         module = Some(ModuleOrUniformRoot::CrateRootAndExternPrelude);
                         continue;

@@ -135,6 +135,7 @@ impl From<DefKind> for ItemType {
             | DefKind::AnonConst
             | DefKind::InlineConst
             | DefKind::OpaqueTy
+            | DefKind::ImplTraitPlaceholder
             | DefKind::Field
             | DefKind::LifetimeParam
             | DefKind::GlobalAsm
@@ -175,6 +176,9 @@ impl ItemType {
             ItemType::ProcDerive => "derive",
             ItemType::TraitAlias => "traitalias",
         }
+    }
+    pub(crate) fn is_method(&self) -> bool {
+        matches!(*self, ItemType::Method | ItemType::TyMethod)
     }
 }
 

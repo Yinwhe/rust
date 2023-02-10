@@ -124,12 +124,17 @@ fn complete_fields(
 
 #[cfg(test)]
 mod tests {
-    use crate::tests::check_edit;
+    use ide_db::SnippetCap;
+
+    use crate::{
+        tests::{check_edit, check_edit_with_config, TEST_CONFIG},
+        CompletionConfig,
+    };
 
     #[test]
     fn literal_struct_completion_edit() {
         check_edit(
-            "FooDesc {…}",
+            "FooDesc{}",
             r#"
 struct FooDesc { pub bar: bool }
 
@@ -152,9 +157,69 @@ fn baz() {
     }
 
     #[test]
+    fn enum_variant_no_snippets() {
+        let conf = CompletionConfig { snippet_cap: SnippetCap::new(false), ..TEST_CONFIG };
+        // tuple variant
+        check_edit_with_config(
+            conf.clone(),
+            "Variant()",
+            r#"
+enum Enum {
+    Variant(usize),
+}
+
+impl Enum {
+    fn new(u: usize) -> Self {
+        Self::Va$0
+    }
+}
+"#,
+            r#"
+enum Enum {
+    Variant(usize),
+}
+
+impl Enum {
+    fn new(u: usize) -> Self {
+        Self::Variant
+    }
+}
+"#,
+        );
+
+        // record variant
+        check_edit_with_config(
+            conf,
+            "Variant{}",
+            r#"
+enum Enum {
+    Variant{u: usize},
+}
+
+impl Enum {
+    fn new(u: usize) -> Self {
+        Self::Va$0
+    }
+}
+"#,
+            r#"
+enum Enum {
+    Variant{u: usize},
+}
+
+impl Enum {
+    fn new(u: usize) -> Self {
+        Self::Variant
+    }
+}
+"#,
+        )
+    }
+
+    #[test]
     fn literal_struct_impl_self_completion() {
         check_edit(
-            "Self {…}",
+            "Self{}",
             r#"
 struct Foo {
     bar: u64,
@@ -180,7 +245,7 @@ impl Foo {
         );
 
         check_edit(
-            "Self(…)",
+            "Self()",
             r#"
 mod submod {
     pub struct Foo(pub u64);
@@ -209,7 +274,7 @@ impl submod::Foo {
     #[test]
     fn literal_struct_completion_from_sub_modules() {
         check_edit(
-            "submod::Struct {…}",
+            "submod::Struct{}",
             r#"
 mod submod {
     pub struct Struct {
@@ -238,7 +303,7 @@ fn f() -> submod::Struct {
     #[test]
     fn literal_struct_complexion_module() {
         check_edit(
-            "FooDesc {…}",
+            "FooDesc{}",
             r#"
 mod _69latrick {
     pub struct FooDesc { pub six: bool, pub neuf: Vec<String>, pub bar: bool }

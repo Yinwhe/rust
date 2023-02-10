@@ -19,6 +19,9 @@ pub trait Sized {}
 #[lang = "destruct"]
 pub trait Destruct {}
 
+#[lang = "tuple_trait"]
+pub trait Tuple {}
+
 #[lang = "unsize"]
 pub trait Unsize<T: ?Sized> {}
 
@@ -443,7 +446,7 @@ pub struct PhantomData<T: ?Sized>;
 
 #[lang = "fn_once"]
 #[rustc_paren_sugar]
-pub trait FnOnce<Args> {
+pub trait FnOnce<Args: Tuple> {
     #[lang = "fn_once_output"]
     type Output;
 
@@ -452,7 +455,7 @@ pub trait FnOnce<Args> {
 
 #[lang = "fn_mut"]
 #[rustc_paren_sugar]
-pub trait FnMut<Args>: FnOnce<Args> {
+pub trait FnMut<Args: Tuple>: FnOnce<Args> {
     extern "rust-call" fn call_mut(&mut self, args: Args) -> Self::Output;
 }
 
@@ -535,7 +538,7 @@ unsafe fn allocate(size: usize, _align: usize) -> *mut u8 {
 }
 
 #[lang = "box_free"]
-unsafe fn box_free<T: ?Sized>(ptr: Unique<T>, alloc: ()) {
+unsafe fn box_free<T: ?Sized>(ptr: Unique<T>, _alloc: ()) {
     libc::free(ptr.pointer.0 as *mut u8);
 }
 
@@ -559,27 +562,41 @@ pub union MaybeUninit<T> {
 
 pub mod intrinsics {
     extern "rust-intrinsic" {
+        #[rustc_safe_intrinsic]
         pub fn abort() -> !;
+        #[rustc_safe_intrinsic]
         pub fn size_of<T>() -> usize;
         pub fn size_of_val<T: ?::Sized>(val: *const T) -> usize;
+        #[rustc_safe_intrinsic]
         pub fn min_align_of<T>() -> usize;
         pub fn min_align_of_val<T: ?::Sized>(val: *const T) -> usize;
         pub fn copy<T>(src: *const T, dst: *mut T, count: usize);
         pub fn transmute<T, U>(e: T) -> U;
         pub fn ctlz_nonzero<T>(x: T) -> T;
+        #[rustc_safe_intrinsic]
         pub fn needs_drop<T: ?::Sized>() -> bool;
+        #[rustc_safe_intrinsic]
         pub fn bitreverse<T>(x: T) -> T;
+        #[rustc_safe_intrinsic]
         pub fn bswap<T>(x: T) -> T;
         pub fn write_bytes<T>(dst: *mut T, val: u8, count: usize);
     }
 }
 
 pub mod libc {
+    // With the new Universal CRT, msvc has switched to all the printf functions being inline wrapper
+    // functions. legacy_stdio_definitions.lib which provides the printf wrapper functions as normal
+    // symbols to link against.
+    #[cfg_attr(unix, link(name = "c"))]
+    #[cfg_attr(target_env="msvc", link(name="legacy_stdio_definitions"))]
+    extern "C" {
+        pub fn printf(format: *const i8, ...) -> i32;
+    }
+
     #[cfg_attr(unix, link(name = "c"))]
     #[cfg_attr(target_env = "msvc", link(name = "msvcrt"))]
     extern "C" {
         pub fn puts(s: *const i8) -> i32;
-        pub fn printf(format: *const i8, ...) -> i32;
         pub fn malloc(size: usize) -> *mut u8;
         pub fn free(ptr: *mut u8);
         pub fn memcpy(dst: *mut u8, src: *const u8, size: usize);

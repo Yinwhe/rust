@@ -1,7 +1,7 @@
+use crate::lints::CStringPtr;
 use crate::LateContext;
 use crate::LateLintPass;
 use crate::LintContext;
-use rustc_errors::fluent;
 use rustc_hir::{Expr, ExprKind, PathSegment};
 use rustc_middle::ty;
 use rustc_span::{symbol::sym, ExpnKind, Span};
@@ -44,9 +44,13 @@ fn in_macro(span: Span) -> bool {
 
 fn first_method_call<'tcx>(
     expr: &'tcx Expr<'tcx>,
-) -> Option<(&'tcx PathSegment<'tcx>, &'tcx [Expr<'tcx>])> {
-    if let ExprKind::MethodCall(path, args, _) = &expr.kind {
-        if args.iter().any(|e| e.span.from_expansion()) { None } else { Some((path, *args)) }
+) -> Option<(&'tcx PathSegment<'tcx>, &'tcx Expr<'tcx>)> {
+    if let ExprKind::MethodCall(path, receiver, args, ..) = &expr.kind {
+        if args.iter().any(|e| e.span.from_expansion()) || receiver.span.from_expansion() {
+            None
+        } else {
+            Some((path, *receiver))
+        }
     } else {
         None
     }
@@ -59,15 +63,13 @@ impl<'tcx> LateLintPass<'tcx> for TemporaryCStringAsPtr {
         }
 
         match first_method_call(expr) {
-            Some((path, args)) if path.ident.name == sym::as_ptr => {
-                let unwrap_arg = &args[0];
+            Some((path, unwrap_arg)) if path.ident.name == sym::as_ptr => {
                 let as_ptr_span = path.ident.span;
                 match first_method_call(unwrap_arg) {
-                    Some((path, args))
+                    Some((path, receiver))
                         if path.ident.name == sym::unwrap || path.ident.name == sym::expect =>
                     {
-                        let source_arg = &args[0];
-                        lint_cstring_as_ptr(cx, as_ptr_span, source_arg, unwrap_arg);
+                        lint_cstring_as_ptr(cx, as_ptr_span, receiver, unwrap_arg);
                     }
                     _ => return,
                 }
@@ -88,14 +90,11 @@ fn lint_cstring_as_ptr(
         if cx.tcx.is_diagnostic_item(sym::Result, def.did()) {
             if let ty::Adt(adt, _) = substs.type_at(0).kind() {
                 if cx.tcx.is_diagnostic_item(sym::cstring_type, adt.did()) {
-                    cx.struct_span_lint(TEMPORARY_CSTRING_AS_PTR, as_ptr_span, |diag| {
-                        diag.build(fluent::lint::cstring_ptr)
-                            .span_label(as_ptr_span, fluent::lint::as_ptr_label)
-                            .span_label(unwrap.span, fluent::lint::unwrap_label)
-                            .note(fluent::lint::note)
-                            .help(fluent::lint::help)
-                            .emit();
-                    });
+                    cx.emit_spanned_lint(
+                        TEMPORARY_CSTRING_AS_PTR,
+                        as_ptr_span,
+                        CStringPtr { as_ptr: as_ptr_span, unwrap: unwrap.span },
+                    );
                 }
             }
         }

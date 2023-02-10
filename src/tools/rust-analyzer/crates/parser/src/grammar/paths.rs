@@ -83,11 +83,12 @@ fn path_segment(p: &mut Parser<'_>, mode: Mode, first: bool) {
         }
         p.expect(T![>]);
     } else {
-        let mut empty = true;
-        if first {
+        let empty = if first {
             p.eat(T![::]);
-            empty = false;
-        }
+            false
+        } else {
+            true
+        };
         match p.current() {
             IDENT => {
                 name_ref(p);
@@ -118,6 +119,11 @@ fn opt_path_type_args(p: &mut Parser<'_>, mode: Mode) {
     match mode {
         Mode::Use => {}
         Mode::Type => {
+            // test typepathfn_with_coloncolon
+            // type F = Start::(Middle) -> (Middle)::End;
+            if p.at(T![::]) && p.nth_at(2, T!['(']) {
+                p.bump(T![::]);
+            }
             // test path_fn_trait_args
             // type F = Box<Fn(i32) -> ()>;
             if p.at(T!['(']) {

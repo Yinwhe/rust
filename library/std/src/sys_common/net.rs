@@ -2,18 +2,19 @@
 mod tests;
 
 use crate::cmp;
-use crate::ffi::CString;
+use crate::convert::{TryFrom, TryInto};
 use crate::fmt;
 use crate::io::{self, ErrorKind, IoSlice, IoSliceMut};
 use crate::mem;
 use crate::net::{Ipv4Addr, Ipv6Addr, Shutdown, SocketAddr};
 use crate::ptr;
+use crate::sys::common::small_c_string::run_with_cstr;
 use crate::sys::net::netc as c;
 use crate::sys::net::{cvt, cvt_gai, cvt_r, init, wrlen_t, Socket};
-use crate::sys_common::{FromInner, IntoInner};
+use crate::sys_common::{AsInner, FromInner, IntoInner};
 use crate::time::Duration;
 
-use libc::{c_int, c_void};
+use crate::ffi::{c_int, c_void};
 
 cfg_if::cfg_if! {
     if #[cfg(any(
@@ -46,7 +47,7 @@ cfg_if::cfg_if! {
         target_os = "dragonfly", target_os = "freebsd",
         target_os = "openbsd", target_os = "netbsd",
         target_os = "solaris", target_os = "illumos"))] {
-        use libc::c_uchar;
+        use crate::ffi::c_uchar;
         type IpV4MultiCastType = c_uchar;
     } else {
         type IpV4MultiCastType = c_int;
@@ -126,8 +127,8 @@ fn to_ipv6mr_interface(value: u32) -> c_int {
 }
 
 #[cfg(not(target_os = "android"))]
-fn to_ipv6mr_interface(value: u32) -> libc::c_uint {
-    value as libc::c_uint
+fn to_ipv6mr_interface(value: u32) -> crate::ffi::c_uint {
+    value as crate::ffi::c_uint
 }
 
 ////////////////////////////////////////////////////////////////////////////////
@@ -197,14 +198,15 @@ impl<'a> TryFrom<(&'a str, u16)> for LookupHost {
     fn try_from((host, port): (&'a str, u16)) -> io::Result<LookupHost> {
         init();
 
-        let c_host = CString::new(host)?;
-        let mut hints: c::addrinfo = unsafe { mem::zeroed() };
-        hints.ai_socktype = c::SOCK_STREAM;
-        let mut res = ptr::null_mut();
-        unsafe {
-            cvt_gai(c::getaddrinfo(c_host.as_ptr(), ptr::null(), &hints, &mut res))
-                .map(|_| LookupHost { original: res, cur: res, port })
-        }
+        run_with_cstr(host.as_bytes(), |c_host| {
+            let mut hints: c::addrinfo = unsafe { mem::zeroed() };
+            hints.ai_socktype = c::SOCK_STREAM;
+            let mut res = ptr::null_mut();
+            unsafe {
+                cvt_gai(c::getaddrinfo(c_host.as_ptr(), ptr::null(), &hints, &mut res))
+                    .map(|_| LookupHost { original: res, cur: res, port })
+            }
+        })
     }
 }
 
@@ -342,6 +344,12 @@ impl TcpStream {
 
     pub fn set_nonblocking(&self, nonblocking: bool) -> io::Result<()> {
         self.inner.set_nonblocking(nonblocking)
+    }
+}
+
+impl AsInner<Socket> for TcpStream {
+    fn as_inner(&self) -> &Socket {
+        &self.inner
     }
 }
 

@@ -34,7 +34,7 @@ use crate::infer::region_constraints::VerifyIfEq;
 /// like are used. This is a particular challenge since this function is invoked
 /// very late in inference and hence cannot make use of the normal inference
 /// machinery.
-#[tracing::instrument(level = "debug", skip(tcx, param_env))]
+#[instrument(level = "debug", skip(tcx, param_env))]
 pub fn extract_verify_if_eq<'tcx>(
     tcx: TyCtxt<'tcx>,
     param_env: ty::ParamEnv<'tcx>,
@@ -71,7 +71,7 @@ pub fn extract_verify_if_eq<'tcx>(
 }
 
 /// True if a (potentially higher-ranked) outlives
-#[tracing::instrument(level = "debug", skip(tcx, param_env))]
+#[instrument(level = "debug", skip(tcx, param_env))]
 pub(super) fn can_match_erased_ty<'tcx>(
     tcx: TyCtxt<'tcx>,
     param_env: ty::ParamEnv<'tcx>,
@@ -110,7 +110,7 @@ impl<'tcx> Match<'tcx> {
 
     /// Binds the pattern variable `br` to `value`; returns an `Err` if the pattern
     /// is already bound to a different value.
-    #[tracing::instrument(level = "debug", skip(self))]
+    #[instrument(level = "debug", skip(self))]
     fn bind(
         &mut self,
         br: ty::BoundRegion,
@@ -136,6 +136,11 @@ impl<'tcx> TypeRelation<'tcx> for Match<'tcx> {
     fn tag(&self) -> &'static str {
         "Match"
     }
+
+    fn intercrate(&self) -> bool {
+        false
+    }
+
     fn tcx(&self) -> TyCtxt<'tcx> {
         self.tcx
     }
@@ -146,14 +151,21 @@ impl<'tcx> TypeRelation<'tcx> for Match<'tcx> {
         true
     } // irrelevant
 
+    fn mark_ambiguous(&mut self) {
+        bug!()
+    }
+
+    #[instrument(level = "trace", skip(self))]
     fn relate_with_variance<T: Relate<'tcx>>(
         &mut self,
-        _: ty::Variance,
+        variance: ty::Variance,
         _: ty::VarianceDiagInfo<'tcx>,
         a: T,
         b: T,
     ) -> RelateResult<'tcx, T> {
-        self.relate(a, b)
+        // Opaque types substs have lifetime parameters.
+        // We must not check them to be equal, as we never insert anything to make them so.
+        if variance != ty::Bivariant { self.relate(a, b) } else { Ok(a) }
     }
 
     #[instrument(skip(self), level = "debug")]

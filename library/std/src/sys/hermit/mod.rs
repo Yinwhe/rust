@@ -25,6 +25,7 @@ pub mod cmath;
 pub mod env;
 pub mod fd;
 pub mod fs;
+pub mod futex;
 #[path = "../unsupported/io.rs"]
 pub mod io;
 pub mod memchr;
@@ -45,14 +46,14 @@ pub mod thread_local_dtor;
 pub mod thread_local_key;
 pub mod time;
 
-mod condvar;
-mod mutex;
-mod rwlock;
-
+#[path = "../unix/locks"]
 pub mod locks {
-    pub use super::condvar::*;
-    pub use super::mutex::*;
-    pub use super::rwlock::*;
+    mod futex_condvar;
+    mod futex_mutex;
+    mod futex_rwlock;
+    pub(crate) use futex_condvar::Condvar;
+    pub(crate) use futex_mutex::Mutex;
+    pub(crate) use futex_rwlock::RwLock;
 }
 
 use crate::io::ErrorKind;
@@ -98,16 +99,14 @@ pub extern "C" fn __rust_abort() {
 
 // SAFETY: must be called only once during runtime initialization.
 // NOTE: this is not guaranteed to run, for example when Rust code is called externally.
-pub unsafe fn init(argc: isize, argv: *const *const u8) {
+pub unsafe fn init(argc: isize, argv: *const *const u8, _sigpipe: u8) {
     let _ = net::init();
     args::init(argc, argv);
 }
 
 // SAFETY: must be called only once during runtime cleanup.
 // NOTE: this is not guaranteed to run, for example when the program aborts.
-pub unsafe fn cleanup() {
-    args::cleanup();
-}
+pub unsafe fn cleanup() {}
 
 #[cfg(not(test))]
 #[no_mangle]

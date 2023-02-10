@@ -7,28 +7,29 @@
 
 use crate::clean::PrimitiveType;
 use crate::html::escape::Escape;
-use crate::html::render::Context;
+use crate::html::render::{Context, LinkFromSrc};
 
 use std::collections::VecDeque;
 use std::fmt::{Display, Write};
 
 use rustc_data_structures::fx::FxHashMap;
-use rustc_lexer::{LiteralKind, TokenKind};
+use rustc_lexer::{Cursor, LiteralKind, TokenKind};
 use rustc_span::edition::Edition;
 use rustc_span::symbol::Symbol;
 use rustc_span::{BytePos, Span, DUMMY_SP};
 
 use super::format::{self, Buffer};
-use super::render::LinkFromSrc;
 
 /// This type is needed in case we want to render links on items to allow to go to their definition.
-pub(crate) struct HrefContext<'a, 'b, 'c> {
-    pub(crate) context: &'a Context<'b>,
+pub(crate) struct HrefContext<'a, 'tcx> {
+    pub(crate) context: &'a Context<'tcx>,
     /// This span contains the current file we're going through.
     pub(crate) file_span: Span,
     /// This field is used to know "how far" from the top of the directory we are to link to either
     /// documentation pages or other source pages.
-    pub(crate) root_path: &'c str,
+    pub(crate) root_path: &'a str,
+    /// This field is used to calculate precise local URLs.
+    pub(crate) current_href: String,
 }
 
 /// Decorations are represented as a map from CSS class to vector of character ranges.
@@ -52,19 +53,52 @@ pub(crate) fn render_example_with_highlighting(
     tooltip: Tooltip,
     playground_button: Option<&str>,
 ) {
-    let class = match tooltip {
-        Tooltip::Ignore => " ignore",
-        Tooltip::CompileFail => " compile_fail",
-        Tooltip::ShouldPanic => " should_panic",
-        Tooltip::Edition(_) => " edition",
-        Tooltip::None => "",
-    };
+    write_header(out, "rust-example-rendered", None, tooltip);
+    write_code(out, src, None, None);
+    write_footer(out, playground_button);
+}
+
+/// Highlights `src` as an item-decl, returning the HTML output.
+pub(crate) fn render_item_decl_with_highlighting(src: &str, out: &mut Buffer) {
+    write!(out, "<pre class=\"rust item-decl\">");
+    write_code(out, src, None, None);
+    write!(out, "</pre>");
+}
+
+/// Highlights `src` as a source code page, returning the HTML output.
+pub(crate) fn render_source_with_highlighting(
+    src: &str,
+    out: &mut Buffer,
+    line_numbers: Buffer,
+    href_context: HrefContext<'_, '_>,
+    decoration_info: DecorationInfo,
+    extra: Option<&str>,
+) {
+    write_header(out, "", Some(line_numbers), Tooltip::None);
+    if let Some(extra) = extra {
+        out.push_str(extra);
+    }
+    write_code(out, src, Some(href_context), Some(decoration_info));
+    write_footer(out, None);
+}
+
+fn write_header(out: &mut Buffer, class: &str, extra_content: Option<Buffer>, tooltip: Tooltip) {
+    write!(
+        out,
+        "<div class=\"example-wrap{}\">",
+        match tooltip {
+            Tooltip::Ignore => " ignore",
+            Tooltip::CompileFail => " compile_fail",
+            Tooltip::ShouldPanic => " should_panic",
+            Tooltip::Edition(_) => " edition",
+            Tooltip::None => "",
+        },
+    );
 
     if tooltip != Tooltip::None {
         write!(
             out,
-            "<div class='information'><div class='tooltip{}'{}>ⓘ</div></div>",
-            class,
+            "<div class='tooltip'{}>ⓘ</div>",
             if let Tooltip::Edition(edition_info) = tooltip {
                 format!(" data-edition=\"{}\"", edition_info)
             } else {
@@ -73,89 +107,15 @@ pub(crate) fn render_example_with_highlighting(
         );
     }
 
-    write_header(out, &format!("rust-example-rendered{}", class), None);
-    write_code(out, src, None, None);
-    write_footer(out, playground_button);
-}
-
-/// Highlights `src` as a macro, returning the HTML output.
-pub(crate) fn render_macro_with_highlighting(src: &str, out: &mut Buffer) {
-    write_header(out, "macro", None);
-    write_code(out, src, None, None);
-    write_footer(out, None);
-}
-
-/// Highlights `src` as a source code page, returning the HTML output.
-pub(crate) fn render_source_with_highlighting(
-    src: &str,
-    out: &mut Buffer,
-    line_numbers: Buffer,
-    href_context: HrefContext<'_, '_, '_>,
-    decoration_info: DecorationInfo,
-) {
-    write_header(out, "", Some(line_numbers));
-    write_code(out, src, Some(href_context), Some(decoration_info));
-    write_footer(out, None);
-}
-
-fn write_header(out: &mut Buffer, class: &str, extra_content: Option<Buffer>) {
-    write!(out, "<div class=\"example-wrap\">");
     if let Some(extra) = extra_content {
         out.push_buffer(extra);
     }
     if class.is_empty() {
         write!(out, "<pre class=\"rust\">");
     } else {
-        write!(out, "<pre class=\"rust {}\">", class);
+        write!(out, "<pre class=\"rust {class}\">");
     }
     write!(out, "<code>");
-}
-
-/// Write all the pending elements sharing a same (or at mergeable) `Class`.
-///
-/// If there is a "parent" (if a `EnterSpan` event was encountered) and the parent can be merged
-/// with the elements' class, then we simply write the elements since the `ExitSpan` event will
-/// close the tag.
-///
-/// Otherwise, if there is only one pending element, we let the `string` function handle both
-/// opening and closing the tag, otherwise we do it into this function.
-fn write_pending_elems(
-    out: &mut Buffer,
-    href_context: &Option<HrefContext<'_, '_, '_>>,
-    pending_elems: &mut Vec<(&str, Option<Class>)>,
-    current_class: &mut Option<Class>,
-    closing_tags: &[(&str, Class)],
-) {
-    if pending_elems.is_empty() {
-        return;
-    }
-    let mut done = false;
-    if let Some((_, parent_class)) = closing_tags.last() {
-        if can_merge(*current_class, Some(*parent_class), "") {
-            for (text, class) in pending_elems.iter() {
-                string(out, Escape(text), *class, &href_context, false);
-            }
-            done = true;
-        }
-    }
-    if !done {
-        // We only want to "open" the tag ourselves if we have more than one pending and if the current
-        // parent tag is not the same as our pending content.
-        let open_tag_ourselves = pending_elems.len() > 1;
-        let close_tag = if open_tag_ourselves {
-            enter_span(out, current_class.unwrap(), &href_context)
-        } else {
-            ""
-        };
-        for (text, class) in pending_elems.iter() {
-            string(out, Escape(text), *class, &href_context, !open_tag_ourselves);
-        }
-        if open_tag_ourselves {
-            exit_span(out, close_tag);
-        }
-    }
-    pending_elems.clear();
-    *current_class = None;
 }
 
 /// Check if two `Class` can be merged together. In the following rules, "unclassified" means `None`
@@ -171,7 +131,88 @@ fn can_merge(class1: Option<Class>, class2: Option<Class>, text: &str) -> bool {
         (Some(c1), Some(c2)) => c1.is_equal_to(c2),
         (Some(Class::Ident(_)), None) | (None, Some(Class::Ident(_))) => true,
         (Some(_), None) | (None, Some(_)) => text.trim().is_empty(),
-        _ => false,
+        (None, None) => true,
+    }
+}
+
+/// This type is used as a conveniency to prevent having to pass all its fields as arguments into
+/// the various functions (which became its methods).
+struct TokenHandler<'a, 'tcx> {
+    out: &'a mut Buffer,
+    /// It contains the closing tag and the associated `Class`.
+    closing_tags: Vec<(&'static str, Class)>,
+    /// This is used because we don't automatically generate the closing tag on `ExitSpan` in
+    /// case an `EnterSpan` event with the same class follows.
+    pending_exit_span: Option<Class>,
+    /// `current_class` and `pending_elems` are used to group HTML elements with same `class`
+    /// attributes to reduce the DOM size.
+    current_class: Option<Class>,
+    /// We need to keep the `Class` for each element because it could contain a `Span` which is
+    /// used to generate links.
+    pending_elems: Vec<(&'a str, Option<Class>)>,
+    href_context: Option<HrefContext<'a, 'tcx>>,
+}
+
+impl<'a, 'tcx> TokenHandler<'a, 'tcx> {
+    fn handle_exit_span(&mut self) {
+        // We can't get the last `closing_tags` element using `pop()` because `closing_tags` is
+        // being used in `write_pending_elems`.
+        let class = self.closing_tags.last().expect("ExitSpan without EnterSpan").1;
+        // We flush everything just in case...
+        self.write_pending_elems(Some(class));
+
+        exit_span(self.out, self.closing_tags.pop().expect("ExitSpan without EnterSpan").0);
+        self.pending_exit_span = None;
+    }
+
+    /// Write all the pending elements sharing a same (or at mergeable) `Class`.
+    ///
+    /// If there is a "parent" (if a `EnterSpan` event was encountered) and the parent can be merged
+    /// with the elements' class, then we simply write the elements since the `ExitSpan` event will
+    /// close the tag.
+    ///
+    /// Otherwise, if there is only one pending element, we let the `string` function handle both
+    /// opening and closing the tag, otherwise we do it into this function.
+    ///
+    /// It returns `true` if `current_class` must be set to `None` afterwards.
+    fn write_pending_elems(&mut self, current_class: Option<Class>) -> bool {
+        if self.pending_elems.is_empty() {
+            return false;
+        }
+        if let Some((_, parent_class)) = self.closing_tags.last() &&
+            can_merge(current_class, Some(*parent_class), "")
+        {
+            for (text, class) in self.pending_elems.iter() {
+                string(self.out, Escape(text), *class, &self.href_context, false);
+            }
+        } else {
+            // We only want to "open" the tag ourselves if we have more than one pending and if the
+            // current parent tag is not the same as our pending content.
+            let close_tag = if self.pending_elems.len() > 1 && current_class.is_some() {
+                Some(enter_span(self.out, current_class.unwrap(), &self.href_context))
+            } else {
+                None
+            };
+            for (text, class) in self.pending_elems.iter() {
+                string(self.out, Escape(text), *class, &self.href_context, close_tag.is_none());
+            }
+            if let Some(close_tag) = close_tag {
+                exit_span(self.out, close_tag);
+            }
+        }
+        self.pending_elems.clear();
+        true
+    }
+}
+
+impl<'a, 'tcx> Drop for TokenHandler<'a, 'tcx> {
+    /// When leaving, we need to flush all pending data to not have missing content.
+    fn drop(&mut self) {
+        if self.pending_exit_span.is_some() {
+            self.handle_exit_span();
+        } else {
+            self.write_pending_elems(self.current_class);
+        }
     }
 }
 
@@ -189,69 +230,77 @@ fn can_merge(class1: Option<Class>, class2: Option<Class>, text: &str) -> bool {
 fn write_code(
     out: &mut Buffer,
     src: &str,
-    href_context: Option<HrefContext<'_, '_, '_>>,
+    href_context: Option<HrefContext<'_, '_>>,
     decoration_info: Option<DecorationInfo>,
 ) {
     // This replace allows to fix how the code source with DOS backline characters is displayed.
     let src = src.replace("\r\n", "\n");
-    // It contains the closing tag and the associated `Class`.
-    let mut closing_tags: Vec<(&'static str, Class)> = Vec::new();
-    // The following two variables are used to group HTML elements with same `class` attributes
-    // to reduce the DOM size.
-    let mut current_class: Option<Class> = None;
-    // We need to keep the `Class` for each element because it could contain a `Span` which is
-    // used to generate links.
-    let mut pending_elems: Vec<(&str, Option<Class>)> = Vec::new();
+    let mut token_handler = TokenHandler {
+        out,
+        closing_tags: Vec::new(),
+        pending_exit_span: None,
+        current_class: None,
+        pending_elems: Vec::new(),
+        href_context,
+    };
 
     Classifier::new(
         &src,
-        href_context.as_ref().map(|c| c.file_span).unwrap_or(DUMMY_SP),
+        token_handler.href_context.as_ref().map(|c| c.file_span).unwrap_or(DUMMY_SP),
         decoration_info,
     )
     .highlight(&mut |highlight| {
         match highlight {
             Highlight::Token { text, class } => {
+                // If we received a `ExitSpan` event and then have a non-compatible `Class`, we
+                // need to close the `<span>`.
+                let need_current_class_update = if let Some(pending) = token_handler.pending_exit_span &&
+                    !can_merge(Some(pending), class, text) {
+                        token_handler.handle_exit_span();
+                        true
                 // If the two `Class` are different, time to flush the current content and start
                 // a new one.
-                if !can_merge(current_class, class, text) {
-                    write_pending_elems(
-                        out,
-                        &href_context,
-                        &mut pending_elems,
-                        &mut current_class,
-                        &closing_tags,
-                    );
-                    current_class = class.map(Class::dummy);
-                } else if current_class.is_none() {
-                    current_class = class.map(Class::dummy);
+                } else if !can_merge(token_handler.current_class, class, text) {
+                    token_handler.write_pending_elems(token_handler.current_class);
+                    true
+                } else {
+                    token_handler.current_class.is_none()
+                };
+
+                if need_current_class_update {
+                    token_handler.current_class = class.map(Class::dummy);
                 }
-                pending_elems.push((text, class));
+                token_handler.pending_elems.push((text, class));
             }
             Highlight::EnterSpan { class } => {
-                // We flush everything just in case...
-                write_pending_elems(
-                    out,
-                    &href_context,
-                    &mut pending_elems,
-                    &mut current_class,
-                    &closing_tags,
-                );
-                closing_tags.push((enter_span(out, class, &href_context), class))
+                let mut should_add = true;
+                if let Some(pending_exit_span) = token_handler.pending_exit_span {
+                    if class.is_equal_to(pending_exit_span) {
+                        should_add = false;
+                    } else {
+                        token_handler.handle_exit_span();
+                    }
+                } else {
+                    // We flush everything just in case...
+                    if token_handler.write_pending_elems(token_handler.current_class) {
+                        token_handler.current_class = None;
+                    }
+                }
+                if should_add {
+                    let closing_tag = enter_span(token_handler.out, class, &token_handler.href_context);
+                    token_handler.closing_tags.push((closing_tag, class));
+                }
+
+                token_handler.current_class = None;
+                token_handler.pending_exit_span = None;
             }
             Highlight::ExitSpan => {
-                // We flush everything just in case...
-                write_pending_elems(
-                    out,
-                    &href_context,
-                    &mut pending_elems,
-                    &mut current_class,
-                    &closing_tags,
-                );
-                exit_span(out, closing_tags.pop().expect("ExitSpan without EnterSpan").0)
+                token_handler.current_class = None;
+                token_handler.pending_exit_span =
+                    Some(token_handler.closing_tags.last().as_ref().expect("ExitSpan without EnterSpan").1);
             }
         };
     });
-    write_pending_elems(out, &href_context, &mut pending_elems, &mut current_class, &closing_tags);
 }
 
 fn write_footer(out: &mut Buffer, playground_button: Option<&str>) {
@@ -291,8 +340,8 @@ impl Class {
         match (self, other) {
             (Self::Self_(_), Self::Self_(_))
             | (Self::Macro(_), Self::Macro(_))
-            | (Self::Ident(_), Self::Ident(_))
-            | (Self::Decoration(_), Self::Decoration(_)) => true,
+            | (Self::Ident(_), Self::Ident(_)) => true,
+            (Self::Decoration(c1), Self::Decoration(c2)) => c1 == c2,
             (x, y) => x == y,
         }
     }
@@ -313,7 +362,7 @@ impl Class {
         match self {
             Class::Comment => "comment",
             Class::DocComment => "doccomment",
-            Class::Attribute => "attribute",
+            Class::Attribute => "attr",
             Class::KeyWord => "kw",
             Class::RefKeyWord => "kw-2",
             Class::Self_(_) => "self",
@@ -362,15 +411,16 @@ enum Highlight<'a> {
 
 struct TokenIter<'a> {
     src: &'a str,
+    cursor: Cursor<'a>,
 }
 
 impl<'a> Iterator for TokenIter<'a> {
     type Item = (TokenKind, &'a str);
     fn next(&mut self) -> Option<(TokenKind, &'a str)> {
-        if self.src.is_empty() {
+        let token = self.cursor.advance_token();
+        if token.kind == TokenKind::Eof {
             return None;
         }
-        let token = rustc_lexer::first_token(self.src);
         let (text, rest) = self.src.split_at(token.len as usize);
         self.src = rest;
         Some((token.kind, text))
@@ -408,7 +458,7 @@ impl<'a> PeekIter<'a> {
     fn new(iter: TokenIter<'a>) -> Self {
         Self { stored: VecDeque::new(), peek_pos: 0, iter }
     }
-    /// Returns the next item after the current one. It doesn't interfer with `peek_next` output.
+    /// Returns the next item after the current one. It doesn't interfere with `peek_next` output.
     fn peek(&mut self) -> Option<&(TokenKind, &'a str)> {
         if self.stored.is_empty() {
             if let Some(next) = self.iter.next() {
@@ -417,7 +467,7 @@ impl<'a> PeekIter<'a> {
         }
         self.stored.front()
     }
-    /// Returns the next item after the last one peeked. It doesn't interfer with `peek` output.
+    /// Returns the next item after the last one peeked. It doesn't interfere with `peek` output.
     fn peek_next(&mut self) -> Option<&(TokenKind, &'a str)> {
         self.peek_pos += 1;
         if self.peek_pos - 1 < self.stored.len() {
@@ -464,22 +514,22 @@ impl Decorations {
 
 /// Processes program tokens, classifying strings of text by highlighting
 /// category (`Class`).
-struct Classifier<'a> {
-    tokens: PeekIter<'a>,
+struct Classifier<'src> {
+    tokens: PeekIter<'src>,
     in_attribute: bool,
     in_macro: bool,
     in_macro_nonterminal: bool,
     byte_pos: u32,
     file_span: Span,
-    src: &'a str,
+    src: &'src str,
     decorations: Option<Decorations>,
 }
 
-impl<'a> Classifier<'a> {
+impl<'src> Classifier<'src> {
     /// Takes as argument the source code to HTML-ify, the rust edition to use and the source code
     /// file span which will be used later on by the `span_correspondance_map`.
     fn new(src: &str, file_span: Span, decoration_info: Option<DecorationInfo>) -> Classifier<'_> {
-        let tokens = PeekIter::new(TokenIter { src });
+        let tokens = PeekIter::new(TokenIter { src, cursor: Cursor::new(src) });
         let decorations = decoration_info.map(Decorations::new);
         Classifier {
             tokens,
@@ -553,7 +603,7 @@ impl<'a> Classifier<'a> {
     ///
     /// It returns the token's kind, the token as a string and its byte position in the source
     /// string.
-    fn next(&mut self) -> Option<(TokenKind, &'a str, u32)> {
+    fn next(&mut self) -> Option<(TokenKind, &'src str, u32)> {
         if let Some((kind, text)) = self.tokens.next() {
             let before = self.byte_pos;
             self.byte_pos += text.len() as u32;
@@ -568,7 +618,7 @@ impl<'a> Classifier<'a> {
     /// The general structure for this method is to iterate over each token,
     /// possibly giving it an HTML span with a class specifying what flavor of
     /// token is used.
-    fn highlight(mut self, sink: &mut dyn FnMut(Highlight<'a>)) {
+    fn highlight(mut self, sink: &mut dyn FnMut(Highlight<'src>)) {
         loop {
             if let Some(decs) = self.decorations.as_mut() {
                 let byte_pos = self.byte_pos;
@@ -616,8 +666,8 @@ impl<'a> Classifier<'a> {
     fn advance(
         &mut self,
         token: TokenKind,
-        text: &'a str,
-        sink: &mut dyn FnMut(Highlight<'a>),
+        text: &'src str,
+        sink: &mut dyn FnMut(Highlight<'src>),
         before: u32,
     ) {
         let lookahead = self.peek();
@@ -761,7 +811,7 @@ impl<'a> Classifier<'a> {
             TokenKind::CloseBracket => {
                 if self.in_attribute {
                     self.in_attribute = false;
-                    sink(Highlight::Token { text: "]", class: Some(Class::Attribute) });
+                    sink(Highlight::Token { text: "]", class: None });
                     sink(Highlight::ExitSpan);
                     return;
                 }
@@ -804,6 +854,7 @@ impl<'a> Classifier<'a> {
                 Class::Ident(self.new_span(before, text))
             }
             TokenKind::Lifetime { .. } => Class::Lifetime,
+            TokenKind::Eof => panic!("Eof in advance"),
         };
         // Anything that didn't return above is the simple case where we the
         // class just spans a single token, so we can use the `string` method.
@@ -830,7 +881,7 @@ impl<'a> Classifier<'a> {
 fn enter_span(
     out: &mut Buffer,
     klass: Class,
-    href_context: &Option<HrefContext<'_, '_, '_>>,
+    href_context: &Option<HrefContext<'_, '_>>,
 ) -> &'static str {
     string_without_closing_tag(out, "", Some(klass), href_context, true).expect(
         "internal error: enter_span was called with Some(klass) but did not return a \
@@ -863,7 +914,7 @@ fn string<T: Display>(
     out: &mut Buffer,
     text: T,
     klass: Option<Class>,
-    href_context: &Option<HrefContext<'_, '_, '_>>,
+    href_context: &Option<HrefContext<'_, '_>>,
     open_tag: bool,
 ) {
     if let Some(closing_tag) = string_without_closing_tag(out, text, klass, href_context, open_tag)
@@ -885,7 +936,7 @@ fn string_without_closing_tag<T: Display>(
     out: &mut Buffer,
     text: T,
     klass: Option<Class>,
-    href_context: &Option<HrefContext<'_, '_, '_>>,
+    href_context: &Option<HrefContext<'_, '_>>,
     open_tag: bool,
 ) -> Option<&'static str> {
     let Some(klass) = klass
@@ -933,9 +984,9 @@ fn string_without_closing_tag<T: Display>(
                 // a link to their definition can be generated using this:
                 // https://github.com/rust-lang/rust/blob/60f1a2fc4b535ead9c85ce085fdce49b1b097531/src/librustdoc/html/render/context.rs#L315-L338
                 match href {
-                    LinkFromSrc::Local(span) => context
-                        .href_from_span(*span, true)
-                        .map(|s| format!("{}{}", href_context.root_path, s)),
+                    LinkFromSrc::Local(span) => {
+                        context.href_from_span_relative(*span, &href_context.current_href)
+                    }
                     LinkFromSrc::External(def_id) => {
                         format::href_with_root_path(*def_id, context, Some(href_context.root_path))
                             .ok()

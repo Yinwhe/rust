@@ -294,7 +294,7 @@ impl AtomicBool {
     /// ```
     /// use std::sync::atomic::AtomicBool;
     ///
-    /// let atomic_true  = AtomicBool::new(true);
+    /// let atomic_true = AtomicBool::new(true);
     /// let atomic_false = AtomicBool::new(false);
     /// ```
     #[inline]
@@ -928,8 +928,8 @@ impl AtomicBool {
     /// ```
     #[inline]
     #[unstable(feature = "atomic_mut_ptr", reason = "recently added", issue = "66893")]
-    pub fn as_mut_ptr(&self) -> *mut bool {
-        self.v.get() as *mut bool
+    pub const fn as_mut_ptr(&self) -> *mut bool {
+        self.v.get().cast()
     }
 
     /// Fetches the value, and applies a function to it that returns an optional
@@ -954,6 +954,14 @@ impl AtomicBool {
     ///
     /// **Note:** This method is only available on platforms that support atomic
     /// operations on `u8`.
+    ///
+    /// # Considerations
+    ///
+    /// This method is not magic;  it is not provided by the hardware.
+    /// It is implemented in terms of [`AtomicBool::compare_exchange_weak`], and suffers from the same drawbacks.
+    /// In particular, this method will not circumvent the [ABA Problem].
+    ///
+    /// [ABA Problem]: https://en.wikipedia.org/wiki/ABA_problem
     ///
     /// # Examples
     ///
@@ -1171,7 +1179,7 @@ impl<T> AtomicPtr<T> {
     /// use std::sync::atomic::{AtomicPtr, Ordering};
     ///
     /// let ptr = &mut 5;
-    /// let some_ptr  = AtomicPtr::new(ptr);
+    /// let some_ptr = AtomicPtr::new(ptr);
     ///
     /// let value = some_ptr.load(Ordering::Relaxed);
     /// ```
@@ -1198,7 +1206,7 @@ impl<T> AtomicPtr<T> {
     /// use std::sync::atomic::{AtomicPtr, Ordering};
     ///
     /// let ptr = &mut 5;
-    /// let some_ptr  = AtomicPtr::new(ptr);
+    /// let some_ptr = AtomicPtr::new(ptr);
     ///
     /// let other_ptr = &mut 10;
     ///
@@ -1230,7 +1238,7 @@ impl<T> AtomicPtr<T> {
     /// use std::sync::atomic::{AtomicPtr, Ordering};
     ///
     /// let ptr = &mut 5;
-    /// let some_ptr  = AtomicPtr::new(ptr);
+    /// let some_ptr = AtomicPtr::new(ptr);
     ///
     /// let other_ptr = &mut 10;
     ///
@@ -1282,9 +1290,9 @@ impl<T> AtomicPtr<T> {
     /// use std::sync::atomic::{AtomicPtr, Ordering};
     ///
     /// let ptr = &mut 5;
-    /// let some_ptr  = AtomicPtr::new(ptr);
+    /// let some_ptr = AtomicPtr::new(ptr);
     ///
-    /// let other_ptr   = &mut 10;
+    /// let other_ptr = &mut 10;
     ///
     /// let value = some_ptr.compare_and_swap(ptr, other_ptr, Ordering::Relaxed);
     /// ```
@@ -1325,9 +1333,9 @@ impl<T> AtomicPtr<T> {
     /// use std::sync::atomic::{AtomicPtr, Ordering};
     ///
     /// let ptr = &mut 5;
-    /// let some_ptr  = AtomicPtr::new(ptr);
+    /// let some_ptr = AtomicPtr::new(ptr);
     ///
-    /// let other_ptr   = &mut 10;
+    /// let other_ptr = &mut 10;
     ///
     /// let value = some_ptr.compare_exchange(ptr, other_ptr,
     ///                                       Ordering::SeqCst, Ordering::Relaxed);
@@ -1421,6 +1429,14 @@ impl<T> AtomicPtr<T> {
     ///
     /// **Note:** This method is only available on platforms that support atomic
     /// operations on pointers.
+    ///
+    /// # Considerations
+    ///
+    /// This method is not magic;  it is not provided by the hardware.
+    /// It is implemented in terms of [`AtomicPtr::compare_exchange_weak`], and suffers from the same drawbacks.
+    /// In particular, this method will not circumvent the [ABA Problem].
+    ///
+    /// [ABA Problem]: https://en.wikipedia.org/wiki/ABA_problem
     ///
     /// # Examples
     ///
@@ -1554,8 +1570,8 @@ impl<T> AtomicPtr<T> {
     /// Offsets the pointer's address by adding `val` *bytes*, returning the
     /// previous pointer.
     ///
-    /// This is equivalent to using [`wrapping_add`] and [`cast`] to atomically
-    /// perform `ptr = ptr.cast::<u8>().wrapping_add(val).cast::<T>()`.
+    /// This is equivalent to using [`wrapping_byte_add`] to atomically
+    /// perform `ptr = ptr.wrapping_byte_add(val)`.
     ///
     /// `fetch_byte_add` takes an [`Ordering`] argument which describes the
     /// memory ordering of this operation. All ordering modes are possible. Note
@@ -1565,8 +1581,7 @@ impl<T> AtomicPtr<T> {
     /// **Note**: This method is only available on platforms that support atomic
     /// operations on [`AtomicPtr`].
     ///
-    /// [`wrapping_add`]: pointer::wrapping_add
-    /// [`cast`]: pointer::cast
+    /// [`wrapping_byte_add`]: pointer::wrapping_byte_add
     ///
     /// # Examples
     ///
@@ -1591,8 +1606,8 @@ impl<T> AtomicPtr<T> {
     /// Offsets the pointer's address by subtracting `val` *bytes*, returning the
     /// previous pointer.
     ///
-    /// This is equivalent to using [`wrapping_sub`] and [`cast`] to atomically
-    /// perform `ptr = ptr.cast::<u8>().wrapping_sub(val).cast::<T>()`.
+    /// This is equivalent to using [`wrapping_byte_sub`] to atomically
+    /// perform `ptr = ptr.wrapping_byte_sub(val)`.
     ///
     /// `fetch_byte_sub` takes an [`Ordering`] argument which describes the
     /// memory ordering of this operation. All ordering modes are possible. Note
@@ -1602,8 +1617,7 @@ impl<T> AtomicPtr<T> {
     /// **Note**: This method is only available on platforms that support atomic
     /// operations on [`AtomicPtr`].
     ///
-    /// [`wrapping_sub`]: pointer::wrapping_sub
-    /// [`cast`]: pointer::cast
+    /// [`wrapping_byte_sub`]: pointer::wrapping_byte_sub
     ///
     /// # Examples
     ///
@@ -1628,8 +1642,8 @@ impl<T> AtomicPtr<T> {
     /// and the argument `val`, and stores a pointer with provenance of the
     /// current pointer and the resulting address.
     ///
-    /// This is equivalent equivalent to using [`map_addr`] to atomically
-    /// perform `ptr = ptr.map_addr(|a| a | val)`. This can be used in tagged
+    /// This is equivalent to using [`map_addr`] to atomically perform
+    /// `ptr = ptr.map_addr(|a| a | val)`. This can be used in tagged
     /// pointer schemes to atomically set tag bits.
     ///
     /// **Caveat**: This operation returns the previous value. To compute the
@@ -1679,8 +1693,8 @@ impl<T> AtomicPtr<T> {
     /// pointer, and the argument `val`, and stores a pointer with provenance of
     /// the current pointer and the resulting address.
     ///
-    /// This is equivalent equivalent to using [`map_addr`] to atomically
-    /// perform `ptr = ptr.map_addr(|a| a & val)`. This can be used in tagged
+    /// This is equivalent to using [`map_addr`] to atomically perform
+    /// `ptr = ptr.map_addr(|a| a & val)`. This can be used in tagged
     /// pointer schemes to atomically unset tag bits.
     ///
     /// **Caveat**: This operation returns the previous value. To compute the
@@ -1729,8 +1743,8 @@ impl<T> AtomicPtr<T> {
     /// pointer, and the argument `val`, and stores a pointer with provenance of
     /// the current pointer and the resulting address.
     ///
-    /// This is equivalent equivalent to using [`map_addr`] to atomically
-    /// perform `ptr = ptr.map_addr(|a| a ^ val)`. This can be used in tagged
+    /// This is equivalent to using [`map_addr`] to atomically perform
+    /// `ptr = ptr.map_addr(|a| a ^ val)`. This can be used in tagged
     /// pointer schemes to atomically toggle tag bits.
     ///
     /// **Caveat**: This operation returns the previous value. To compute the
@@ -1772,6 +1786,42 @@ impl<T> AtomicPtr<T> {
         // SAFETY: data races are prevented by atomic intrinsics.
         unsafe { atomic_xor(self.p.get(), core::ptr::invalid_mut(val), order).cast() }
     }
+
+    /// Returns a mutable pointer to the underlying pointer.
+    ///
+    /// Doing non-atomic reads and writes on the resulting integer can be a data race.
+    /// This method is mostly useful for FFI, where the function signature may use
+    /// `*mut *mut T` instead of `&AtomicPtr<T>`.
+    ///
+    /// Returning an `*mut` pointer from a shared reference to this atomic is safe because the
+    /// atomic types work with interior mutability. All modifications of an atomic change the value
+    /// through a shared reference, and can do so safely as long as they use atomic operations. Any
+    /// use of the returned raw pointer requires an `unsafe` block and still has to uphold the same
+    /// restriction: operations on it must be atomic.
+    ///
+    /// # Examples
+    ///
+    /// ```ignore (extern-declaration)
+    /// #![feature(atomic_mut_ptr)]
+    /// use std::sync::atomic::AtomicPtr;
+    ///
+    /// extern "C" {
+    ///     fn my_atomic_op(arg: *mut *mut u32);
+    /// }
+    ///
+    /// let mut value = 17;
+    /// let atomic = AtomicPtr::new(&mut value);
+    ///
+    /// // SAFETY: Safe as long as `my_atomic_op` is atomic.
+    /// unsafe {
+    ///     my_atomic_op(atomic.as_mut_ptr());
+    /// }
+    /// ```
+    #[inline]
+    #[unstable(feature = "atomic_mut_ptr", reason = "recently added", issue = "66893")]
+    pub const fn as_mut_ptr(&self) -> *mut *mut T {
+        self.p.get()
+    }
 }
 
 #[cfg(target_has_atomic_load_store = "8")]
@@ -1811,7 +1861,8 @@ macro_rules! if_not_8_bit {
     ($_:ident, $($tt:tt)*) => { $($tt)* };
 }
 
-#[cfg(target_has_atomic_load_store = "8")]
+#[cfg_attr(not(bootstrap), cfg(target_has_atomic_load_store))]
+#[cfg_attr(bootstrap, cfg(target_has_atomic_load_store = "8"))]
 macro_rules! atomic_int {
     ($cfg_cas:meta,
      $cfg_align:meta,
@@ -2512,6 +2563,16 @@ macro_rules! atomic_int {
             /// **Note**: This method is only available on platforms that support atomic operations on
             #[doc = concat!("[`", $s_int_type, "`].")]
             ///
+            /// # Considerations
+            ///
+            /// This method is not magic;  it is not provided by the hardware.
+            /// It is implemented in terms of
+            #[doc = concat!("[`", stringify!($atomic_type), "::compare_exchange_weak`],")]
+            /// and suffers from the same drawbacks.
+            /// In particular, this method will not circumvent the [ABA Problem].
+            ///
+            /// [ABA Problem]: https://en.wikipedia.org/wiki/ABA_problem
+            ///
             /// # Examples
             ///
             /// ```rust
@@ -2654,9 +2715,9 @@ macro_rules! atomic_int {
             #[doc = concat!("    fn my_atomic_op(arg: *mut ", stringify!($int_type), ");")]
             /// }
             ///
-            #[doc = concat!("let mut atomic = ", stringify!($atomic_type), "::new(1);")]
+            #[doc = concat!("let atomic = ", stringify!($atomic_type), "::new(1);")]
             ///
-            // SAFETY: Safe as long as `my_atomic_op` is atomic.
+            /// // SAFETY: Safe as long as `my_atomic_op` is atomic.
             /// unsafe {
             ///     my_atomic_op(atomic.as_mut_ptr());
             /// }
@@ -2666,7 +2727,7 @@ macro_rules! atomic_int {
             #[unstable(feature = "atomic_mut_ptr",
                    reason = "recently added",
                    issue = "66893")]
-            pub fn as_mut_ptr(&self) -> *mut $int_type {
+            pub const fn as_mut_ptr(&self) -> *mut $int_type {
                 self.v.get()
             }
         }
@@ -2928,7 +2989,8 @@ atomic_int_ptr_sized! {
 }
 
 #[inline]
-#[cfg(target_has_atomic = "8")]
+#[cfg_attr(not(bootstrap), cfg(target_has_atomic))]
+#[cfg_attr(bootstrap, cfg(target_has_atomic = "8"))]
 fn strongest_failure_ordering(order: Ordering) -> Ordering {
     match order {
         Release => Relaxed,
@@ -2970,7 +3032,8 @@ unsafe fn atomic_load<T: Copy>(dst: *const T, order: Ordering) -> T {
 }
 
 #[inline]
-#[cfg(target_has_atomic = "8")]
+#[cfg_attr(not(bootstrap), cfg(target_has_atomic))]
+#[cfg_attr(bootstrap, cfg(target_has_atomic = "8"))]
 #[cfg_attr(miri, track_caller)] // even without panics, this helps for Miri backtraces
 unsafe fn atomic_swap<T: Copy>(dst: *mut T, val: T, order: Ordering) -> T {
     // SAFETY: the caller must uphold the safety contract for `atomic_swap`.
@@ -2987,7 +3050,8 @@ unsafe fn atomic_swap<T: Copy>(dst: *mut T, val: T, order: Ordering) -> T {
 
 /// Returns the previous value (like __sync_fetch_and_add).
 #[inline]
-#[cfg(target_has_atomic = "8")]
+#[cfg_attr(not(bootstrap), cfg(target_has_atomic))]
+#[cfg_attr(bootstrap, cfg(target_has_atomic = "8"))]
 #[cfg_attr(miri, track_caller)] // even without panics, this helps for Miri backtraces
 unsafe fn atomic_add<T: Copy>(dst: *mut T, val: T, order: Ordering) -> T {
     // SAFETY: the caller must uphold the safety contract for `atomic_add`.
@@ -3004,7 +3068,8 @@ unsafe fn atomic_add<T: Copy>(dst: *mut T, val: T, order: Ordering) -> T {
 
 /// Returns the previous value (like __sync_fetch_and_sub).
 #[inline]
-#[cfg(target_has_atomic = "8")]
+#[cfg_attr(not(bootstrap), cfg(target_has_atomic))]
+#[cfg_attr(bootstrap, cfg(target_has_atomic = "8"))]
 #[cfg_attr(miri, track_caller)] // even without panics, this helps for Miri backtraces
 unsafe fn atomic_sub<T: Copy>(dst: *mut T, val: T, order: Ordering) -> T {
     // SAFETY: the caller must uphold the safety contract for `atomic_sub`.
@@ -3020,7 +3085,8 @@ unsafe fn atomic_sub<T: Copy>(dst: *mut T, val: T, order: Ordering) -> T {
 }
 
 #[inline]
-#[cfg(target_has_atomic = "8")]
+#[cfg_attr(not(bootstrap), cfg(target_has_atomic))]
+#[cfg_attr(bootstrap, cfg(target_has_atomic = "8"))]
 #[cfg_attr(miri, track_caller)] // even without panics, this helps for Miri backtraces
 unsafe fn atomic_compare_exchange<T: Copy>(
     dst: *mut T,
@@ -3055,7 +3121,8 @@ unsafe fn atomic_compare_exchange<T: Copy>(
 }
 
 #[inline]
-#[cfg(target_has_atomic = "8")]
+#[cfg_attr(not(bootstrap), cfg(target_has_atomic))]
+#[cfg_attr(bootstrap, cfg(target_has_atomic = "8"))]
 #[cfg_attr(miri, track_caller)] // even without panics, this helps for Miri backtraces
 unsafe fn atomic_compare_exchange_weak<T: Copy>(
     dst: *mut T,
@@ -3090,7 +3157,8 @@ unsafe fn atomic_compare_exchange_weak<T: Copy>(
 }
 
 #[inline]
-#[cfg(target_has_atomic = "8")]
+#[cfg_attr(not(bootstrap), cfg(target_has_atomic))]
+#[cfg_attr(bootstrap, cfg(target_has_atomic = "8"))]
 #[cfg_attr(miri, track_caller)] // even without panics, this helps for Miri backtraces
 unsafe fn atomic_and<T: Copy>(dst: *mut T, val: T, order: Ordering) -> T {
     // SAFETY: the caller must uphold the safety contract for `atomic_and`
@@ -3106,7 +3174,8 @@ unsafe fn atomic_and<T: Copy>(dst: *mut T, val: T, order: Ordering) -> T {
 }
 
 #[inline]
-#[cfg(target_has_atomic = "8")]
+#[cfg_attr(not(bootstrap), cfg(target_has_atomic))]
+#[cfg_attr(bootstrap, cfg(target_has_atomic = "8"))]
 #[cfg_attr(miri, track_caller)] // even without panics, this helps for Miri backtraces
 unsafe fn atomic_nand<T: Copy>(dst: *mut T, val: T, order: Ordering) -> T {
     // SAFETY: the caller must uphold the safety contract for `atomic_nand`
@@ -3122,7 +3191,8 @@ unsafe fn atomic_nand<T: Copy>(dst: *mut T, val: T, order: Ordering) -> T {
 }
 
 #[inline]
-#[cfg(target_has_atomic = "8")]
+#[cfg_attr(not(bootstrap), cfg(target_has_atomic))]
+#[cfg_attr(bootstrap, cfg(target_has_atomic = "8"))]
 #[cfg_attr(miri, track_caller)] // even without panics, this helps for Miri backtraces
 unsafe fn atomic_or<T: Copy>(dst: *mut T, val: T, order: Ordering) -> T {
     // SAFETY: the caller must uphold the safety contract for `atomic_or`
@@ -3138,7 +3208,8 @@ unsafe fn atomic_or<T: Copy>(dst: *mut T, val: T, order: Ordering) -> T {
 }
 
 #[inline]
-#[cfg(target_has_atomic = "8")]
+#[cfg_attr(not(bootstrap), cfg(target_has_atomic))]
+#[cfg_attr(bootstrap, cfg(target_has_atomic = "8"))]
 #[cfg_attr(miri, track_caller)] // even without panics, this helps for Miri backtraces
 unsafe fn atomic_xor<T: Copy>(dst: *mut T, val: T, order: Ordering) -> T {
     // SAFETY: the caller must uphold the safety contract for `atomic_xor`
@@ -3155,7 +3226,8 @@ unsafe fn atomic_xor<T: Copy>(dst: *mut T, val: T, order: Ordering) -> T {
 
 /// returns the max value (signed comparison)
 #[inline]
-#[cfg(target_has_atomic = "8")]
+#[cfg_attr(not(bootstrap), cfg(target_has_atomic))]
+#[cfg_attr(bootstrap, cfg(target_has_atomic = "8"))]
 #[cfg_attr(miri, track_caller)] // even without panics, this helps for Miri backtraces
 unsafe fn atomic_max<T: Copy>(dst: *mut T, val: T, order: Ordering) -> T {
     // SAFETY: the caller must uphold the safety contract for `atomic_max`
@@ -3172,7 +3244,8 @@ unsafe fn atomic_max<T: Copy>(dst: *mut T, val: T, order: Ordering) -> T {
 
 /// returns the min value (signed comparison)
 #[inline]
-#[cfg(target_has_atomic = "8")]
+#[cfg_attr(not(bootstrap), cfg(target_has_atomic))]
+#[cfg_attr(bootstrap, cfg(target_has_atomic = "8"))]
 #[cfg_attr(miri, track_caller)] // even without panics, this helps for Miri backtraces
 unsafe fn atomic_min<T: Copy>(dst: *mut T, val: T, order: Ordering) -> T {
     // SAFETY: the caller must uphold the safety contract for `atomic_min`
@@ -3189,7 +3262,8 @@ unsafe fn atomic_min<T: Copy>(dst: *mut T, val: T, order: Ordering) -> T {
 
 /// returns the max value (unsigned comparison)
 #[inline]
-#[cfg(target_has_atomic = "8")]
+#[cfg_attr(not(bootstrap), cfg(target_has_atomic))]
+#[cfg_attr(bootstrap, cfg(target_has_atomic = "8"))]
 #[cfg_attr(miri, track_caller)] // even without panics, this helps for Miri backtraces
 unsafe fn atomic_umax<T: Copy>(dst: *mut T, val: T, order: Ordering) -> T {
     // SAFETY: the caller must uphold the safety contract for `atomic_umax`
@@ -3206,7 +3280,8 @@ unsafe fn atomic_umax<T: Copy>(dst: *mut T, val: T, order: Ordering) -> T {
 
 /// returns the min value (unsigned comparison)
 #[inline]
-#[cfg(target_has_atomic = "8")]
+#[cfg_attr(not(bootstrap), cfg(target_has_atomic))]
+#[cfg_attr(bootstrap, cfg(target_has_atomic = "8"))]
 #[cfg_attr(miri, track_caller)] // even without panics, this helps for Miri backtraces
 unsafe fn atomic_umin<T: Copy>(dst: *mut T, val: T, order: Ordering) -> T {
     // SAFETY: the caller must uphold the safety contract for `atomic_umin`

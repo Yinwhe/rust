@@ -1,8 +1,5 @@
-//! The Rust compiler.
-//!
-//! # Note
-//!
-//! This API is completely unstable and subject to change.
+// This crate is intentionally empty and a rexport of `rustc_driver_impl` to allow the code in
+// `rustc_driver_impl` to be compiled in parallel with other crates.
 
 #![doc(html_root_url = "https://doc.rust-lang.org/nightly/nightly-rustc/")]
 #![feature(let_else)]
@@ -1375,3 +1372,4 @@ pub fn main() -> ! {
 
     process::exit(exit_code)
 }
+pub use rustc_driver_impl::*;

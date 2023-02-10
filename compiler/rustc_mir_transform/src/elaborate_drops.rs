@@ -18,13 +18,38 @@ use rustc_span::Span;
 use rustc_target::abi::VariantIdx;
 use std::fmt;
 
+/// During MIR building, Drop and DropAndReplace terminators are inserted in every place where a drop may occur.
+/// However, in this phase, the presence of these terminators does not guarantee that a destructor will run,
+/// as the target of the drop may be uninitialized.
+/// In general, the compiler cannot determine at compile time whether a destructor will run or not.
+///
+/// At a high level, this pass refines Drop and DropAndReplace to only run the destructor if the
+/// target is initialized. The way this is achievied is by inserting drop flags for every variable
+/// that may be dropped, and then using those flags to determine whether a destructor should run.
+/// This pass also removes DropAndReplace, replacing it with a Drop paired with an assign statement.
+/// Once this is complete, Drop terminators in the MIR correspond to a call to the "drop glue" or
+/// "drop shim" for the type of the dropped place.
+///
+/// This pass relies on dropped places having an associated move path, which is then used to determine
+/// the initialization status of the place and its descendants.
+/// It's worth noting that a MIR containing a Drop without an associated move path is probably ill formed,
+/// as it would allow running a destructor on a place behind a reference:
+///
+/// ```text
+// fn drop_term<T>(t: &mut T) {
+//     mir!(
+//         {
+//             Drop(*t, exit)
+//         }
+//         exit = {
+//             Return()
+//         }
+//     )
+// }
+/// ```
 pub struct ElaborateDrops;
 
 impl<'tcx> MirPass<'tcx> for ElaborateDrops {
-    fn phase_change(&self) -> Option<MirPhase> {
-        Some(MirPhase::DropsLowered)
-    }
-
     fn run_pass(&self, tcx: TyCtxt<'tcx>, body: &mut Body<'tcx>) {
         debug!("elaborate_drops({:?} @ {:?})", body.source, body.span);
 
@@ -89,13 +114,13 @@ fn find_dead_unwinds<'tcx>(
     debug!("find_dead_unwinds({:?})", body.span);
     // We only need to do this pass once, because unwind edges can only
     // reach cleanup blocks, which can't have unwind edges themselves.
-    let mut dead_unwinds = BitSet::new_empty(body.basic_blocks().len());
+    let mut dead_unwinds = BitSet::new_empty(body.basic_blocks.len());
     let mut flow_inits = MaybeInitializedPlaces::new(tcx, body, &env)
         .into_engine(tcx, body)
         .pass_name("find_dead_unwinds")
         .iterate_to_fixpoint()
         .into_results_cursor(body);
-    for (bb, bb_data) in body.basic_blocks().iter_enumerated() {
+    for (bb, bb_data) in body.basic_blocks.iter_enumerated() {
         let place = match bb_data.terminator().kind {
             TerminatorKind::Drop { ref place, unwind: Some(_), .. }
             | TerminatorKind::DropAndReplace { ref place, unwind: Some(_), .. } => {
@@ -303,7 +328,7 @@ impl<'b, 'tcx> ElaborateDropsCtxt<'b, 'tcx> {
     }
 
     fn collect_drop_flags(&mut self) {
-        for (bb, data) in self.body.basic_blocks().iter_enumerated() {
+        for (bb, data) in self.body.basic_blocks.iter_enumerated() {
             let terminator = data.terminator();
             let place = match terminator.kind {
                 TerminatorKind::Drop { ref place, .. }
@@ -358,7 +383,7 @@ impl<'b, 'tcx> ElaborateDropsCtxt<'b, 'tcx> {
     }
 
     fn elaborate_drops(&mut self) {
-        for (bb, data) in self.body.basic_blocks().iter_enumerated() {
+        for (bb, data) in self.body.basic_blocks.iter_enumerated() {
             let loc = Location { block: bb, statement_index: data.statements.len() };
             let terminator = data.terminator();
 
@@ -515,7 +540,7 @@ impl<'b, 'tcx> ElaborateDropsCtxt<'b, 'tcx> {
     }
 
     fn drop_flags_for_fn_rets(&mut self) {
-        for (bb, data) in self.body.basic_blocks().iter_enumerated() {
+        for (bb, data) in self.body.basic_blocks.iter_enumerated() {
             if let TerminatorKind::Call {
                 destination, target: Some(tgt), cleanup: Some(_), ..
             } = data.terminator().kind
@@ -550,7 +575,7 @@ impl<'b, 'tcx> ElaborateDropsCtxt<'b, 'tcx> {
         // drop flags by themselves, to avoid the drop flags being
         // clobbered before they are read.
 
-        for (bb, data) in self.body.basic_blocks().iter_enumerated() {
+        for (bb, data) in self.body.basic_blocks.iter_enumerated() {
             debug!("drop_flags_for_locs({:?})", data);
             for i in 0..(data.statements.len() + 1) {
                 debug!("drop_flag_for_locs: stmt {}", i);

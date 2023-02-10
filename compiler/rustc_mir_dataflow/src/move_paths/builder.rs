@@ -243,7 +243,7 @@ pub(super) fn gather_moves<'tcx>(
 
     builder.gather_args();
 
-    for (bb, block) in body.basic_blocks().iter_enumerated() {
+    for (bb, block) in body.basic_blocks.iter_enumerated() {
         for (i, stmt) in block.statements.iter().enumerate() {
             let source = Location { block: bb, statement_index: i };
             builder.gather_statement(source, stmt);
@@ -330,7 +330,8 @@ impl<'b, 'a, 'tcx> Gatherer<'b, 'a, 'tcx> {
             StatementKind::Retag { .. }
             | StatementKind::AscribeUserType(..)
             | StatementKind::Coverage(..)
-            | StatementKind::CopyNonOverlapping(..)
+            | StatementKind::Intrinsic(..)
+            | StatementKind::ConstEvalCounter
             | StatementKind::Nop => {}
         }
     }
@@ -375,7 +376,8 @@ impl<'b, 'a, 'tcx> Gatherer<'b, 'a, 'tcx> {
             | TerminatorKind::Resume
             | TerminatorKind::Abort
             | TerminatorKind::GeneratorDrop
-            | TerminatorKind::Unreachable => {}
+            | TerminatorKind::Unreachable
+            | TerminatorKind::Drop { .. } => {}
 
             TerminatorKind::Assert { ref cond, .. } => {
                 self.gather_operand(cond);
@@ -389,10 +391,6 @@ impl<'b, 'a, 'tcx> Gatherer<'b, 'a, 'tcx> {
                 self.gather_operand(value);
                 self.create_move_path(place);
                 self.gather_init(place.as_ref(), InitKind::Deep);
-            }
-
-            TerminatorKind::Drop { place, target: _, unwind: _ } => {
-                self.gather_move(place);
             }
             TerminatorKind::DropAndReplace { place, ref value, .. } => {
                 self.create_move_path(place);

@@ -86,7 +86,7 @@ fn generate_nodes(kinds: KindsSrc<'_>, grammar: &AstSrc) -> String {
                 .traits
                 .iter()
                 .filter(|trait_name| {
-                    // Loops have two expressions so this might collide, therefor manual impl it
+                    // Loops have two expressions so this might collide, therefore manual impl it
                     node.name != "ForExpr" && node.name != "WhileExpr"
                         || trait_name.as_str() != "HasLoopBody"
                 })
@@ -169,10 +169,7 @@ fn generate_nodes(kinds: KindsSrc<'_>, grammar: &AstSrc) -> String {
                 quote! {
                     impl AstNode for #name {
                         fn can_cast(kind: SyntaxKind) -> bool {
-                            match kind {
-                                #(#kinds)|* => true,
-                                _ => false,
-                            }
+                            matches!(kind, #(#kinds)|*)
                         }
                         fn cast(syntax: SyntaxNode) -> Option<Self> {
                             let res = match syntax.kind() {
@@ -253,13 +250,10 @@ fn generate_nodes(kinds: KindsSrc<'_>, grammar: &AstSrc) -> String {
                     }
                     impl AstNode for #name {
                         fn can_cast(kind: SyntaxKind) -> bool {
-                            match kind {
-                                #(#kinds)|* => true,
-                                _ => false,
-                            }
+                            matches!(kind, #(#kinds)|*)
                         }
                         fn cast(syntax: SyntaxNode) -> Option<Self> {
-                            Self::can_cast(syntax.kind()).then(|| #name { syntax })
+                            Self::can_cast(syntax.kind()).then_some(#name { syntax })
                         }
                         fn syntax(&self) -> &SyntaxNode {
                             &self.syntax
@@ -334,7 +328,7 @@ fn generate_nodes(kinds: KindsSrc<'_>, grammar: &AstSrc) -> String {
 
 fn write_doc_comment(contents: &[String], dest: &mut String) {
     for line in contents {
-        writeln!(dest, "///{}", line).unwrap();
+        writeln!(dest, "///{line}").unwrap();
     }
 }
 
@@ -410,24 +404,17 @@ fn generate_syntax_kinds(grammar: KindsSrc<'_>) -> String {
 
         impl SyntaxKind {
             pub fn is_keyword(self) -> bool {
-                match self {
-                    #(#all_keywords)|* => true,
-                    _ => false,
-                }
+                matches!(self, #(#all_keywords)|*)
             }
 
             pub fn is_punct(self) -> bool {
-                match self {
-                    #(#punctuation)|* => true,
-                    _ => false,
-                }
+
+                matches!(self, #(#punctuation)|*)
+
             }
 
             pub fn is_literal(self) -> bool {
-                match self {
-                    #(#literals)|* => true,
-                    _ => false,
-                }
+                matches!(self, #(#literals)|*)
             }
 
             pub fn from_keyword(ident: &str) -> Option<SyntaxKind> {
@@ -514,7 +501,7 @@ fn to_pascal_case(s: &str) -> String {
 }
 
 fn pluralize(s: &str) -> String {
-    format!("{}s", s)
+    format!("{s}s")
 }
 
 impl Field {
@@ -650,7 +637,7 @@ fn lower_rule(acc: &mut Vec<Field>, grammar: &Grammar, label: Option<&String>, r
             let mut name = grammar[*token].name.clone();
             if name != "int_number" && name != "string" {
                 if "[]{}()".contains(&name) {
-                    name = format!("'{}'", name);
+                    name = format!("'{name}'");
                 }
                 let field = Field::Token(name);
                 acc.push(field);
@@ -664,7 +651,7 @@ fn lower_rule(acc: &mut Vec<Field>, grammar: &Grammar, label: Option<&String>, r
                 acc.push(field);
                 return;
             }
-            panic!("unhandled rule: {:?}", rule)
+            panic!("unhandled rule: {rule:?}")
         }
         Rule::Labeled { label: l, rule } => {
             assert!(label.is_none());

@@ -12,11 +12,10 @@ use rustc_data_structures::fx::FxHashMap;
 use rustc_hir::def_id::DefId;
 use rustc_index::vec::Idx;
 use rustc_middle::mir::interpret::{
-    read_target_uint, AllocId, Allocation, ConstAllocation, ConstValue, GlobalAlloc, Pointer,
-    Provenance,
+    alloc_range, read_target_uint, AllocId, Allocation, ConstAllocation, ConstValue, GlobalAlloc,
+    Pointer, Provenance,
 };
 use rustc_middle::mir::visit::Visitor;
-use rustc_middle::mir::MirSource;
 use rustc_middle::mir::*;
 use rustc_middle::ty::{self, TyCtxt};
 use rustc_target::abi::Size;
@@ -74,7 +73,7 @@ pub enum PassWhere {
 #[inline]
 pub fn dump_mir<'tcx, F>(
     tcx: TyCtxt<'tcx>,
-    pass_num: Option<&dyn Display>,
+    pass_num: bool,
     pass_name: &str,
     disambiguator: &dyn Display,
     body: &Body<'tcx>,
@@ -89,7 +88,7 @@ pub fn dump_mir<'tcx, F>(
     dump_matched_mir_node(tcx, pass_num, pass_name, disambiguator, body, extra_data);
 }
 
-pub fn dump_enabled<'tcx>(tcx: TyCtxt<'tcx>, pass_name: &str, def_id: DefId) -> bool {
+pub fn dump_enabled(tcx: TyCtxt<'_>, pass_name: &str, def_id: DefId) -> bool {
     let Some(ref filters) = tcx.sess.opts.unstable_opts.dump_mir else {
         return false;
     };
@@ -111,7 +110,7 @@ pub fn dump_enabled<'tcx>(tcx: TyCtxt<'tcx>, pass_name: &str, def_id: DefId) -> 
 
 fn dump_matched_mir_node<'tcx, F>(
     tcx: TyCtxt<'tcx>,
-    pass_num: Option<&dyn Display>,
+    pass_num: bool,
     pass_name: &str,
     disambiguator: &dyn Display,
     body: &Body<'tcx>,
@@ -120,8 +119,7 @@ fn dump_matched_mir_node<'tcx, F>(
     F: FnMut(PassWhere, &mut dyn Write) -> io::Result<()>,
 {
     let _: io::Result<()> = try {
-        let mut file =
-            create_dump_file(tcx, "mir", pass_num, pass_name, disambiguator, body.source)?;
+        let mut file = create_dump_file(tcx, "mir", pass_num, pass_name, disambiguator, body)?;
         // see notes on #41697 above
         let def_path =
             ty::print::with_forced_impl_filename_line!(tcx.def_path_str(body.source.def_id()));
@@ -143,16 +141,14 @@ fn dump_matched_mir_node<'tcx, F>(
 
     if tcx.sess.opts.unstable_opts.dump_mir_graphviz {
         let _: io::Result<()> = try {
-            let mut file =
-                create_dump_file(tcx, "dot", pass_num, pass_name, disambiguator, body.source)?;
+            let mut file = create_dump_file(tcx, "dot", pass_num, pass_name, disambiguator, body)?;
             write_mir_fn_graphviz(tcx, body, false, &mut file)?;
         };
     }
 
     if let Some(spanview) = tcx.sess.opts.unstable_opts.dump_mir_spanview {
         let _: io::Result<()> = try {
-            let file_basename =
-                dump_file_basename(tcx, pass_num, pass_name, disambiguator, body.source);
+            let file_basename = dump_file_basename(tcx, pass_num, pass_name, disambiguator, body);
             let mut file = create_dump_file_with_basename(tcx, &file_basename, "html")?;
             if body.source.def_id().is_local() {
                 write_mir_fn_spanview(tcx, body, spanview, &file_basename, &mut file)?;
@@ -165,11 +161,12 @@ fn dump_matched_mir_node<'tcx, F>(
 /// where we should dump a MIR representation output files.
 fn dump_file_basename<'tcx>(
     tcx: TyCtxt<'tcx>,
-    pass_num: Option<&dyn Display>,
+    pass_num: bool,
     pass_name: &str,
     disambiguator: &dyn Display,
-    source: MirSource<'tcx>,
+    body: &Body<'tcx>,
 ) -> String {
+    let source = body.source;
     let promotion_id = match source.promoted {
         Some(id) => format!("-{:?}", id),
         None => String::new(),
@@ -178,9 +175,10 @@ fn dump_file_basename<'tcx>(
     let pass_num = if tcx.sess.opts.unstable_opts.dump_mir_exclude_pass_number {
         String::new()
     } else {
-        match pass_num {
-            None => ".-------".to_string(),
-            Some(pass_num) => format!(".{}", pass_num),
+        if pass_num {
+            format!(".{:03}-{:03}", body.phase.phase_index(), body.pass_count)
+        } else {
+            ".-------".to_string()
         }
     };
 
@@ -250,14 +248,14 @@ fn create_dump_file_with_basename(
 pub fn create_dump_file<'tcx>(
     tcx: TyCtxt<'tcx>,
     extension: &str,
-    pass_num: Option<&dyn Display>,
+    pass_num: bool,
     pass_name: &str,
     disambiguator: &dyn Display,
-    source: MirSource<'tcx>,
+    body: &Body<'tcx>,
 ) -> io::Result<io::BufWriter<fs::File>> {
     create_dump_file_with_basename(
         tcx,
-        &dump_file_basename(tcx, pass_num, pass_name, disambiguator, source),
+        &dump_file_basename(tcx, pass_num, pass_name, disambiguator, body),
         extension,
     )
 }
@@ -318,10 +316,10 @@ where
     F: FnMut(PassWhere, &mut dyn Write) -> io::Result<()>,
 {
     write_mir_intro(tcx, body, w)?;
-    for block in body.basic_blocks().indices() {
+    for block in body.basic_blocks.indices() {
         extra_data(PassWhere::BeforeBlock(block), w)?;
         write_basic_block(tcx, block, body, extra_data, w)?;
-        if block.index() + 1 != body.basic_blocks().len() {
+        if block.index() + 1 != body.basic_blocks.len() {
             writeln!(w)?;
         }
     }
@@ -423,7 +421,7 @@ impl<'tcx> ExtraComments<'tcx> {
     }
 }
 
-fn use_verbose<'tcx>(ty: Ty<'tcx>, fn_def: bool) -> bool {
+fn use_verbose(ty: Ty<'_>, fn_def: bool) -> bool {
     match *ty.kind() {
         ty::Int(_) | ty::Uint(_) | ty::Bool | ty::Char | ty::Float(_) => false,
         // Unit type
@@ -450,33 +448,43 @@ impl<'tcx> Visitor<'tcx> for ExtraComments<'tcx> {
 
             // FIXME: this is a poor version of `pretty_print_const_value`.
             let fmt_val = |val: &ConstValue<'tcx>| match val {
-                ConstValue::ZeroSized => format!("<ZST>"),
+                ConstValue::ZeroSized => "<ZST>".to_string(),
                 ConstValue::Scalar(s) => format!("Scalar({:?})", s),
-                ConstValue::Slice { .. } => format!("Slice(..)"),
-                ConstValue::ByRef { .. } => format!("ByRef(..)"),
+                ConstValue::Slice { .. } => "Slice(..)".to_string(),
+                ConstValue::ByRef { .. } => "ByRef(..)".to_string(),
             };
 
             let fmt_valtree = |valtree: &ty::ValTree<'tcx>| match valtree {
                 ty::ValTree::Leaf(leaf) => format!("ValTree::Leaf({:?})", leaf),
-                ty::ValTree::Branch(_) => format!("ValTree::Branch(..)"),
+                ty::ValTree::Branch(_) => "ValTree::Branch(..)".to_string(),
             };
 
             let val = match literal {
                 ConstantKind::Ty(ct) => match ct.kind() {
                     ty::ConstKind::Param(p) => format!("Param({})", p),
-                    ty::ConstKind::Unevaluated(uv) => format!(
-                        "Unevaluated({}, {:?}, {:?})",
-                        self.tcx.def_path_str(uv.def.did),
-                        uv.substs,
-                        uv.promoted,
-                    ),
+                    ty::ConstKind::Unevaluated(uv) => {
+                        format!(
+                            "Unevaluated({}, {:?})",
+                            self.tcx.def_path_str(uv.def.did),
+                            uv.substs,
+                        )
+                    }
                     ty::ConstKind::Value(val) => format!("Value({})", fmt_valtree(&val)),
                     ty::ConstKind::Error(_) => "Error".to_string(),
                     // These variants shouldn't exist in the MIR.
                     ty::ConstKind::Placeholder(_)
                     | ty::ConstKind::Infer(_)
+                    | ty::ConstKind::Expr(_)
                     | ty::ConstKind::Bound(..) => bug!("unexpected MIR constant: {:?}", literal),
                 },
+                ConstantKind::Unevaluated(uv, _) => {
+                    format!(
+                        "Unevaluated({}, {:?}, {:?})",
+                        self.tcx.def_path_str(uv.def.did),
+                        uv.substs,
+                        uv.promoted,
+                    )
+                }
                 // To keep the diffs small, we render this like we render `ty::Const::Value`.
                 //
                 // This changes once `ty::Const::Value` is represented using valtrees.
@@ -572,7 +580,7 @@ fn write_scope_tree(
             continue;
         }
 
-        let mut_str = if local_decl.mutability == Mutability::Mut { "mut " } else { "" };
+        let mut_str = local_decl.mutability.prefix_str();
 
         let mut indented_decl =
             format!("{0:1$}let {2}{3:?}: {4:?}", INDENT, indent, mut_str, local, local_decl.ty);
@@ -676,7 +684,7 @@ pub fn write_allocations<'tcx>(
     fn alloc_ids_from_alloc(
         alloc: ConstAllocation<'_>,
     ) -> impl DoubleEndedIterator<Item = AllocId> + '_ {
-        alloc.inner().relocations().values().map(|id| *id)
+        alloc.inner().provenance().ptrs().values().map(|id| *id)
     }
 
     fn alloc_ids_from_const_val(val: ConstValue<'_>) -> impl Iterator<Item = AllocId> + '_ {
@@ -696,9 +704,9 @@ pub fn write_allocations<'tcx>(
     struct CollectAllocIds(BTreeSet<AllocId>);
 
     impl<'tcx> Visitor<'tcx> for CollectAllocIds {
-        fn visit_constant(&mut self, c: &Constant<'tcx>, loc: Location) {
+        fn visit_constant(&mut self, c: &Constant<'tcx>, _: Location) {
             match c.literal {
-                ConstantKind::Ty(c) => self.visit_const(c, loc),
+                ConstantKind::Ty(_) | ConstantKind::Unevaluated(..) => {}
                 ConstantKind::Val(val, _) => {
                     self.0.extend(alloc_ids_from_const_val(val));
                 }
@@ -778,8 +786,8 @@ pub fn write_allocations<'tcx>(
 /// If the allocation is small enough to fit into a single line, no start address is given.
 /// After the hex dump, an ascii dump follows, replacing all unprintable characters (control
 /// characters or characters whose value is larger than 127) with a `.`
-/// This also prints relocations adequately.
-pub fn display_allocation<'a, 'tcx, Prov, Extra>(
+/// This also prints provenance adequately.
+pub fn display_allocation<'a, 'tcx, Prov: Provenance, Extra>(
     tcx: TyCtxt<'tcx>,
     alloc: &'a Allocation<Prov, Extra>,
 ) -> RenderAllocation<'a, 'tcx, Prov, Extra> {
@@ -787,7 +795,7 @@ pub fn display_allocation<'a, 'tcx, Prov, Extra>(
 }
 
 #[doc(hidden)]
-pub struct RenderAllocation<'a, 'tcx, Prov, Extra> {
+pub struct RenderAllocation<'a, 'tcx, Prov: Provenance, Extra> {
     tcx: TyCtxt<'tcx>,
     alloc: &'a Allocation<Prov, Extra>,
 }
@@ -873,34 +881,34 @@ fn write_allocation_bytes<'tcx, Prov: Provenance, Extra>(
         if i != line_start {
             write!(w, " ")?;
         }
-        if let Some(&prov) = alloc.relocations().get(&i) {
-            // Memory with a relocation must be defined
-            assert!(alloc.init_mask().is_range_initialized(i, i + ptr_size).is_ok());
+        if let Some(prov) = alloc.provenance().get_ptr(i) {
+            // Memory with provenance must be defined
+            assert!(alloc.init_mask().is_range_initialized(alloc_range(i, ptr_size)).is_ok());
             let j = i.bytes_usize();
             let offset = alloc
                 .inspect_with_uninit_and_ptr_outside_interpreter(j..j + ptr_size.bytes_usize());
             let offset = read_target_uint(tcx.data_layout.endian, offset).unwrap();
             let offset = Size::from_bytes(offset);
-            let relocation_width = |bytes| bytes * 3;
+            let provenance_width = |bytes| bytes * 3;
             let ptr = Pointer::new(prov, offset);
             let mut target = format!("{:?}", ptr);
-            if target.len() > relocation_width(ptr_size.bytes_usize() - 1) {
+            if target.len() > provenance_width(ptr_size.bytes_usize() - 1) {
                 // This is too long, try to save some space.
                 target = format!("{:#?}", ptr);
             }
             if ((i - line_start) + ptr_size).bytes_usize() > BYTES_PER_LINE {
-                // This branch handles the situation where a relocation starts in the current line
+                // This branch handles the situation where a provenance starts in the current line
                 // but ends in the next one.
                 let remainder = Size::from_bytes(BYTES_PER_LINE) - (i - line_start);
                 let overflow = ptr_size - remainder;
-                let remainder_width = relocation_width(remainder.bytes_usize()) - 2;
-                let overflow_width = relocation_width(overflow.bytes_usize() - 1) + 1;
-                ascii.push('╾');
-                for _ in 0..remainder.bytes() - 1 {
-                    ascii.push('─');
+                let remainder_width = provenance_width(remainder.bytes_usize()) - 2;
+                let overflow_width = provenance_width(overflow.bytes_usize() - 1) + 1;
+                ascii.push('╾'); // HEAVY LEFT AND LIGHT RIGHT
+                for _ in 1..remainder.bytes() {
+                    ascii.push('─'); // LIGHT HORIZONTAL
                 }
                 if overflow_width > remainder_width && overflow_width >= target.len() {
-                    // The case where the relocation fits into the part in the next line
+                    // The case where the provenance fits into the part in the next line
                     write!(w, "╾{0:─^1$}", "", remainder_width)?;
                     line_start =
                         write_allocation_newline(w, line_start, &ascii, pos_width, prefix)?;
@@ -917,25 +925,41 @@ fn write_allocation_bytes<'tcx, Prov: Provenance, Extra>(
                 for _ in 0..overflow.bytes() - 1 {
                     ascii.push('─');
                 }
-                ascii.push('╼');
+                ascii.push('╼'); // LIGHT LEFT AND HEAVY RIGHT
                 i += ptr_size;
                 continue;
             } else {
-                // This branch handles a relocation that starts and ends in the current line.
-                let relocation_width = relocation_width(ptr_size.bytes_usize() - 1);
-                oversized_ptr(&mut target, relocation_width);
+                // This branch handles a provenance that starts and ends in the current line.
+                let provenance_width = provenance_width(ptr_size.bytes_usize() - 1);
+                oversized_ptr(&mut target, provenance_width);
                 ascii.push('╾');
-                write!(w, "╾{0:─^1$}╼", target, relocation_width)?;
+                write!(w, "╾{0:─^1$}╼", target, provenance_width)?;
                 for _ in 0..ptr_size.bytes() - 2 {
                     ascii.push('─');
                 }
                 ascii.push('╼');
                 i += ptr_size;
             }
-        } else if alloc.init_mask().is_range_initialized(i, i + Size::from_bytes(1)).is_ok() {
+        } else if let Some(prov) = alloc.provenance().get(i, &tcx) {
+            // Memory with provenance must be defined
+            assert!(
+                alloc.init_mask().is_range_initialized(alloc_range(i, Size::from_bytes(1))).is_ok()
+            );
+            ascii.push('━'); // HEAVY HORIZONTAL
+            // We have two characters to display this, which is obviously not enough.
+            // Format is similar to "oversized" above.
+            let j = i.bytes_usize();
+            let c = alloc.inspect_with_uninit_and_ptr_outside_interpreter(j..j + 1)[0];
+            write!(w, "╾{:02x}{:#?} (1 ptr byte)╼", c, prov)?;
+            i += Size::from_bytes(1);
+        } else if alloc
+            .init_mask()
+            .is_range_initialized(alloc_range(i, Size::from_bytes(1)))
+            .is_ok()
+        {
             let j = i.bytes_usize();
 
-            // Checked definedness (and thus range) and relocations. This access also doesn't
+            // Checked definedness (and thus range) and provenance. This access also doesn't
             // influence interpreter execution but is only for debugging.
             let c = alloc.inspect_with_uninit_and_ptr_outside_interpreter(j..j + 1)[0];
             write!(w, "{:02x}", c)?;

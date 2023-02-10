@@ -1,6 +1,5 @@
 use crate::stable_hasher;
 use rustc_serialize::{Decodable, Decoder, Encodable, Encoder};
-use std::convert::TryInto;
 use std::hash::{Hash, Hasher};
 
 #[cfg(test)]
@@ -29,7 +28,7 @@ impl Fingerprint {
         // quality hash values, let's still combine the two values because the
         // Fingerprints in DefPathHash have the StableCrateId portion which is
         // the same for all DefPathHashes from the same crate. Combining the
-        // two halfs makes sure we get a good quality hash in such cases too.
+        // two halves makes sure we get a good quality hash in such cases too.
         self.0.wrapping_mul(3).wrapping_add(self.1)
     }
 
@@ -120,7 +119,7 @@ impl FingerprintHasher for crate::unhash::Unhasher {
         // quality hash values, let's still combine the two values because the
         // Fingerprints in DefPathHash have the StableCrateId portion which is
         // the same for all DefPathHashes from the same crate. Combining the
-        // two halfs makes sure we get a good quality hash in such cases too.
+        // two halves makes sure we get a good quality hash in such cases too.
         //
         // Since `Unhasher` is used only in the context of HashMaps, it is OK
         // to combine the two components in an order-independent way (which is
@@ -140,7 +139,7 @@ impl stable_hasher::StableHasherResult for Fingerprint {
     }
 }
 
-impl_stable_hash_via_hash!(Fingerprint);
+impl_stable_traits_for_trivial_type!(Fingerprint);
 
 impl<E: Encoder> Encodable<E> for Fingerprint {
     #[inline]

@@ -69,7 +69,9 @@ fn lit_search_pat(lit: &LitKind) -> (Pat, Pat) {
         LitKind::Str(_, StrStyle::Cooked) => (Pat::Str("\""), Pat::Str("\"")),
         LitKind::Str(_, StrStyle::Raw(0)) => (Pat::Str("r"), Pat::Str("\"")),
         LitKind::Str(_, StrStyle::Raw(_)) => (Pat::Str("r#"), Pat::Str("#")),
-        LitKind::ByteStr(_) => (Pat::Str("b\""), Pat::Str("\"")),
+        LitKind::ByteStr(_, StrStyle::Cooked) => (Pat::Str("b\""), Pat::Str("\"")),
+        LitKind::ByteStr(_, StrStyle::Raw(0)) => (Pat::Str("br\""), Pat::Str("\"")),
+        LitKind::ByteStr(_, StrStyle::Raw(_)) => (Pat::Str("br#\""), Pat::Str("#")),
         LitKind::Byte(_) => (Pat::Str("b'"), Pat::Str("'")),
         LitKind::Char(_) => (Pat::Str("'"), Pat::Str("'")),
         LitKind::Int(_, LitIntType::Signed(IntTy::Isize)) => (Pat::Num, Pat::Str("isize")),
@@ -118,9 +120,9 @@ fn expr_search_pat(tcx: TyCtxt<'_>, e: &Expr<'_>) -> (Pat, Pat) {
         ExprKind::Unary(UnOp::Neg, e) => (Pat::Str("-"), expr_search_pat(tcx, e).1),
         ExprKind::Lit(ref lit) => lit_search_pat(&lit.node),
         ExprKind::Array(_) | ExprKind::Repeat(..) => (Pat::Str("["), Pat::Str("]")),
-        ExprKind::Call(e, []) | ExprKind::MethodCall(_, [e], _) => (expr_search_pat(tcx, e).0, Pat::Str("(")),
+        ExprKind::Call(e, []) | ExprKind::MethodCall(_, e, [], _) => (expr_search_pat(tcx, e).0, Pat::Str("(")),
         ExprKind::Call(first, [.., last])
-        | ExprKind::MethodCall(_, [first, .., last], _)
+        | ExprKind::MethodCall(_, first, [.., last], _)
         | ExprKind::Binary(_, first, last)
         | ExprKind::Tup([first, .., last])
         | ExprKind::Assign(first, last, _)
@@ -140,7 +142,7 @@ fn expr_search_pat(tcx: TyCtxt<'_>, e: &Expr<'_>) -> (Pat, Pat) {
         ExprKind::Match(e, _, MatchSource::AwaitDesugar) | ExprKind::Yield(e, YieldSource::Await { .. }) => {
             (expr_search_pat(tcx, e).0, Pat::Str("await"))
         },
-        ExprKind::Closure(&Closure { body, .. }) => (Pat::Str(""), expr_search_pat(tcx, &tcx.hir().body(body).value).1),
+        ExprKind::Closure(&Closure { body, .. }) => (Pat::Str(""), expr_search_pat(tcx, tcx.hir().body(body).value).1),
         ExprKind::Block(
             Block {
                 rules: BlockCheckMode::UnsafeBlock(UnsafeSource::UserProvided),
@@ -220,7 +222,7 @@ fn trait_item_search_pat(item: &TraitItem<'_>) -> (Pat, Pat) {
 fn impl_item_search_pat(item: &ImplItem<'_>) -> (Pat, Pat) {
     let (start_pat, end_pat) = match &item.kind {
         ImplItemKind::Const(..) => (Pat::Str("const"), Pat::Str(";")),
-        ImplItemKind::TyAlias(..) => (Pat::Str("type"), Pat::Str(";")),
+        ImplItemKind::Type(..) => (Pat::Str("type"), Pat::Str(";")),
         ImplItemKind::Fn(sig, ..) => (fn_header_search_pat(sig.header), Pat::Str("")),
     };
     if item.vis_span.is_empty() {
@@ -254,7 +256,7 @@ fn fn_kind_pat(tcx: TyCtxt<'_>, kind: &FnKind<'_>, body: &Body<'_>, hir_id: HirI
     let (start_pat, end_pat) = match kind {
         FnKind::ItemFn(.., header) => (fn_header_search_pat(*header), Pat::Str("")),
         FnKind::Method(.., sig) => (fn_header_search_pat(sig.header), Pat::Str("")),
-        FnKind::Closure => return (Pat::Str(""), expr_search_pat(tcx, &body.value).1),
+        FnKind::Closure => return (Pat::Str(""), expr_search_pat(tcx, body.value).1),
     };
     let start_pat = match tcx.hir().get(hir_id) {
         Node::Item(Item { vis_span, .. }) | Node::ImplItem(ImplItem { vis_span, .. }) => {

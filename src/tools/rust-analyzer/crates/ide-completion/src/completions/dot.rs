@@ -19,7 +19,7 @@ pub(crate) fn complete_dot(
     };
 
     // Suggest .await syntax for types that implement Future trait
-    if receiver_ty.impls_future(ctx.db) {
+    if receiver_ty.impls_into_future(ctx.db) {
         let mut item =
             CompletionItem::new(CompletionItemKind::Keyword, ctx.source_range(), "await");
         item.detail("expr.await");
@@ -32,12 +32,12 @@ pub(crate) fn complete_dot(
         complete_fields(
             acc,
             ctx,
-            &receiver_ty,
+            receiver_ty,
             |acc, field, ty| acc.add_field(ctx, dot_access, None, field, &ty),
             |acc, field, ty| acc.add_tuple_field(ctx, None, field, &ty),
         );
     }
-    complete_methods(ctx, &receiver_ty, |func| acc.add_method(ctx, dot_access, func, None, None));
+    complete_methods(ctx, receiver_ty, |func| acc.add_method(ctx, dot_access, func, None, None));
 }
 
 pub(crate) fn complete_undotted_self(

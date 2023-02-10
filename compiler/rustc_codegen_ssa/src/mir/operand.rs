@@ -40,10 +40,10 @@ pub enum OperandValue<V> {
 /// instead.
 #[derive(Copy, Clone)]
 pub struct OperandRef<'tcx, V> {
-    // The value.
+    /// The value.
     pub val: OperandValue<V>,
 
-    // The layout of value, based on its Rust type.
+    /// The layout of value, based on its Rust type.
     pub layout: TyAndLayout<'tcx>,
 }
 
@@ -72,10 +72,6 @@ impl<'a, 'tcx, V: CodegenObject> OperandRef<'tcx, V> {
     ) -> Self {
         let layout = bx.layout_of(ty);
 
-        if layout.is_zst() {
-            return OperandRef::new_zst(bx, layout);
-        }
-
         let val = match val {
             ConstValue::Scalar(x) => {
                 let Abi::Scalar(scalar) = layout.abi else {
@@ -84,10 +80,7 @@ impl<'a, 'tcx, V: CodegenObject> OperandRef<'tcx, V> {
                 let llval = bx.scalar_to_backend(x, scalar, bx.immediate_backend_type(layout));
                 OperandValue::Immediate(llval)
             }
-            ConstValue::ZeroSized => {
-                let llval = bx.zst_to_backend(bx.immediate_backend_type(layout));
-                OperandValue::Immediate(llval)
-            }
+            ConstValue::ZeroSized => return OperandRef::new_zst(bx, layout),
             ConstValue::Slice { data, start, end } => {
                 let Abi::ScalarPair(a_scalar, _) = layout.abi else {
                     bug!("from_const: invalid ScalarPair layout: {:#?}", layout);
@@ -359,7 +352,7 @@ impl<'a, 'tcx, V: CodegenObject> OperandValue<V> {
 
         // Allocate an appropriate region on the stack, and copy the value into it
         let (llsize, _) = glue::size_and_align_of_dst(bx, unsized_ty, Some(llextra));
-        let lldst = bx.array_alloca(bx.cx().type_i8(), llsize, max_align);
+        let lldst = bx.byte_array_alloca(llsize, max_align);
         bx.memcpy(lldst, max_align, llptr, min_align, llsize, flags);
 
         // Store the allocated region and the extra to the indirect place.

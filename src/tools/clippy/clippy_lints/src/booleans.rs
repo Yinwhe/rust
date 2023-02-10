@@ -1,14 +1,15 @@
 use clippy_utils::diagnostics::{span_lint_and_sugg, span_lint_hir_and_then};
+use clippy_utils::eq_expr_value;
 use clippy_utils::source::snippet_opt;
 use clippy_utils::ty::{implements_trait, is_type_diagnostic_item};
-use clippy_utils::{eq_expr_value, get_trait_def_id, paths};
 use if_chain::if_chain;
 use rustc_ast::ast::LitKind;
 use rustc_errors::Applicability;
 use rustc_hir::intravisit::{walk_expr, FnKind, Visitor};
-use rustc_hir::{BinOpKind, Body, Expr, ExprKind, FnDecl, HirId, UnOp};
+use rustc_hir::{BinOpKind, Body, Expr, ExprKind, FnDecl, UnOp};
 use rustc_lint::{LateContext, LateLintPass};
 use rustc_session::{declare_lint_pass, declare_tool_lint};
+use rustc_span::def_id::LocalDefId;
 use rustc_span::source_map::Span;
 use rustc_span::sym;
 
@@ -82,7 +83,7 @@ impl<'tcx> LateLintPass<'tcx> for NonminimalBool {
         _: &'tcx FnDecl<'_>,
         body: &'tcx Body<'_>,
         _: Span,
-        _: HirId,
+        _: LocalDefId,
     ) {
         NonminimalBoolVisitor { cx }.visit_body(body);
     }
@@ -237,7 +238,7 @@ impl<'a, 'tcx, 'v> SuggestContext<'a, 'tcx, 'v> {
                 }
             },
             &Term(n) => {
-                let snip = snippet_opt(self.cx, self.terminals[n as usize].span)?;
+                let snip = snippet_opt(self.cx, self.terminals[n as usize].span.source_callsite())?;
                 self.output.push_str(&snip);
             },
         }
@@ -263,15 +264,14 @@ fn simplify_not(cx: &LateContext<'_>, expr: &Expr<'_>) -> Option<String> {
             }
             .and_then(|op| {
                 Some(format!(
-                    "{}{}{}",
+                    "{}{op}{}",
                     snippet_opt(cx, lhs.span)?,
-                    op,
                     snippet_opt(cx, rhs.span)?
                 ))
             })
         },
-        ExprKind::MethodCall(path, args, _) if args.len() == 1 => {
-            let type_of_receiver = cx.typeck_results().expr_ty(&args[0]);
+        ExprKind::MethodCall(path, receiver, [], _) => {
+            let type_of_receiver = cx.typeck_results().expr_ty(receiver);
             if !is_type_diagnostic_item(cx, type_of_receiver, sym::Option)
                 && !is_type_diagnostic_item(cx, type_of_receiver, sym::Result)
             {
@@ -285,7 +285,7 @@ fn simplify_not(cx: &LateContext<'_>, expr: &Expr<'_>) -> Option<String> {
                     let path: &str = path.ident.name.as_str();
                     a == path
                 })
-                .and_then(|(_, neg_method)| Some(format!("{}.{}()", snippet_opt(cx, args[0].span)?, neg_method)))
+                .and_then(|(_, neg_method)| Some(format!("{}.{neg_method}()", snippet_opt(cx, receiver.span)?)))
         },
         _ => None,
     }
@@ -482,9 +482,11 @@ impl<'a, 'tcx> Visitor<'tcx> for NonminimalBoolVisitor<'a, 'tcx> {
     }
 }
 
-fn implements_ord<'tcx>(cx: &LateContext<'tcx>, expr: &Expr<'_>) -> bool {
+fn implements_ord(cx: &LateContext<'_>, expr: &Expr<'_>) -> bool {
     let ty = cx.typeck_results().expr_ty(expr);
-    get_trait_def_id(cx, &paths::ORD).map_or(false, |id| implements_trait(cx, ty, id, &[]))
+    cx.tcx
+        .get_diagnostic_item(sym::Ord)
+        .map_or(false, |id| implements_trait(cx, ty, id, &[]))
 }
 
 struct NotSimplificationVisitor<'a, 'tcx> {

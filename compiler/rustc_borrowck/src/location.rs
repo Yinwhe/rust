@@ -1,3 +1,5 @@
+#![deny(rustc::untranslatable_diagnostic)]
+#![deny(rustc::diagnostic_outside_of_impl)]
 use rustc_index::vec::{Idx, IndexVec};
 use rustc_middle::mir::{BasicBlock, Body, Location};
 
@@ -18,9 +20,8 @@ pub struct LocationTable {
 }
 
 rustc_index::newtype_index! {
-    pub struct LocationIndex {
-        DEBUG_FORMAT = "LocationIndex({})"
-    }
+    #[debug_format = "LocationIndex({})"]
+    pub struct LocationIndex {}
 }
 
 #[derive(Copy, Clone, Debug)]
@@ -33,7 +34,7 @@ impl LocationTable {
     pub(crate) fn new(body: &Body<'_>) -> Self {
         let mut num_points = 0;
         let statements_before_block = body
-            .basic_blocks()
+            .basic_blocks
             .iter()
             .map(|block_data| {
                 let v = num_points;
@@ -86,8 +87,7 @@ impl LocationTable {
         let (block, &first_index) = self
             .statements_before_block
             .iter_enumerated()
-            .filter(|(_, first_index)| **first_index <= point_index)
-            .last()
+            .rfind(|&(_, &first_index)| first_index <= point_index)
             .unwrap();
 
         let statement_index = (point_index - first_index) / 2;

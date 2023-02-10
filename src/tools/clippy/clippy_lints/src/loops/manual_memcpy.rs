@@ -119,7 +119,7 @@ fn build_manual_memcpy_suggestion<'tcx>(
 
     let print_limit = |end: &Expr<'_>, end_str: &str, base: &Expr<'_>, sugg: MinifyingSugg<'static>| {
         if_chain! {
-            if let ExprKind::MethodCall(method, [recv], _) = end.kind;
+            if let ExprKind::MethodCall(method, recv, [], _) = end.kind;
             if method.ident.name == sym::len;
             if path_to_local(recv) == path_to_local(base);
             then {
@@ -177,13 +177,7 @@ fn build_manual_memcpy_suggestion<'tcx>(
     let dst = if dst_offset == sugg::EMPTY && dst_limit == sugg::EMPTY {
         dst_base_str
     } else {
-        format!(
-            "{}[{}..{}]",
-            dst_base_str,
-            dst_offset.maybe_par(),
-            dst_limit.maybe_par()
-        )
-        .into()
+        format!("{dst_base_str}[{}..{}]", dst_offset.maybe_par(), dst_limit.maybe_par()).into()
     };
 
     let method_str = if is_copy(cx, elem_ty) {
@@ -193,10 +187,7 @@ fn build_manual_memcpy_suggestion<'tcx>(
     };
 
     format!(
-        "{}.{}(&{}[{}..{}]);",
-        dst,
-        method_str,
-        src_base_str,
+        "{dst}.{method_str}(&{src_base_str}[{}..{}]);",
         src_offset.maybe_par(),
         src_limit.maybe_par()
     )
@@ -341,7 +332,7 @@ fn get_slice_like_element_ty<'tcx>(cx: &LateContext<'tcx>, ty: Ty<'tcx>) -> Opti
 
 fn fetch_cloned_expr<'tcx>(expr: &'tcx Expr<'tcx>) -> &'tcx Expr<'tcx> {
     if_chain! {
-        if let ExprKind::MethodCall(method, [arg], _) = expr.kind;
+        if let ExprKind::MethodCall(method, arg, [], _) = expr.kind;
         if method.ident.name == sym::clone;
         then { arg } else { expr }
     }

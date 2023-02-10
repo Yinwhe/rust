@@ -6,7 +6,7 @@ use super::CodegenUnitDebugContext;
 use rustc_hir::def_id::DefId;
 use rustc_middle::ty::layout::{HasParamEnv, LayoutOf};
 use rustc_middle::ty::{self, DefIdTree, Ty};
-use tracing::trace;
+use trace;
 
 use crate::common::CodegenCx;
 use crate::llvm;
@@ -72,7 +72,7 @@ pub(crate) fn fat_pointer_kind<'ll, 'tcx>(
         layout.is_unsized()
     );
 
-    if !layout.is_unsized() {
+    if layout.is_sized() {
         return None;
     }
 

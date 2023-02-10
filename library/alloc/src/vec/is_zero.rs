@@ -1,8 +1,11 @@
+use core::num::{Saturating, Wrapping};
+
 use crate::boxed::Box;
 
 #[rustc_specialization_trait]
 pub(super) unsafe trait IsZero {
-    /// Whether this value's representation is all zeros
+    /// Whether this value's representation is all zeros,
+    /// or can be represented with all zeroes.
     fn is_zero(&self) -> bool;
 }
 
@@ -55,7 +58,7 @@ unsafe impl<T: IsZero, const N: usize> IsZero for [T; N] {
     #[inline]
     fn is_zero(&self) -> bool {
         // Because this is generated as a runtime check, it's not obvious that
-        // it's worth doing if the array is really long.  The threshold here
+        // it's worth doing if the array is really long. The threshold here
         // is largely arbitrary, but was picked because as of 2022-07-01 LLVM
         // fails to const-fold the check in `vec![[1; 32]; n]`
         // See https://github.com/rust-lang/rust/pull/97581#issuecomment-1166628022
@@ -144,3 +147,56 @@ impl_is_zero_option_of_nonzero!(
     NonZeroUsize,
     NonZeroIsize,
 );
+
+macro_rules! impl_is_zero_option_of_num {
+    ($($t:ty,)+) => {$(
+        unsafe impl IsZero for Option<$t> {
+            #[inline]
+            fn is_zero(&self) -> bool {
+                const {
+                    let none: Self = unsafe { core::mem::MaybeUninit::zeroed().assume_init() };
+                    assert!(none.is_none());
+                }
+                self.is_none()
+            }
+        }
+    )+};
+}
+
+impl_is_zero_option_of_num!(u8, u16, u32, u64, u128, i8, i16, i32, i64, i128, usize, isize,);
+
+unsafe impl<T: IsZero> IsZero for Wrapping<T> {
+    #[inline]
+    fn is_zero(&self) -> bool {
+        self.0.is_zero()
+    }
+}
+
+unsafe impl<T: IsZero> IsZero for Saturating<T> {
+    #[inline]
+    fn is_zero(&self) -> bool {
+        self.0.is_zero()
+    }
+}
+
+macro_rules! impl_for_optional_bool {
+    ($($t:ty,)+) => {$(
+        unsafe impl IsZero for $t {
+            #[inline]
+            fn is_zero(&self) -> bool {
+                // SAFETY: This is *not* a stable layout guarantee, but
+                // inside `core` we're allowed to rely on the current rustc
+                // behaviour that options of bools will be one byte with
+                // no padding, so long as they're nested less than 254 deep.
+                let raw: u8 = unsafe { core::mem::transmute(*self) };
+                raw == 0
+            }
+        }
+    )+};
+}
+impl_for_optional_bool! {
+    Option<bool>,
+    Option<Option<bool>>,
+    Option<Option<Option<bool>>>,
+    // Could go further, but not worth the metadata overhead
+}

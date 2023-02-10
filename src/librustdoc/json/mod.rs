@@ -5,6 +5,7 @@
 //! docs for usage and details.
 
 mod conversions;
+mod import_finder;
 
 use std::cell::RefCell;
 use std::fs::{create_dir_all, File};
@@ -13,7 +14,7 @@ use std::path::PathBuf;
 use std::rc::Rc;
 
 use rustc_data_structures::fx::FxHashMap;
-use rustc_hir::def_id::DefId;
+use rustc_hir::def_id::{DefId, DefIdSet};
 use rustc_middle::ty::TyCtxt;
 use rustc_session::Session;
 use rustc_span::def_id::LOCAL_CRATE;
@@ -39,6 +40,7 @@ pub(crate) struct JsonRenderer<'tcx> {
     /// The directory where the blob will be written to.
     out_path: PathBuf,
     cache: Rc<Cache>,
+    imported_items: DefIdSet,
 }
 
 impl<'tcx> JsonRenderer<'tcx> {
@@ -97,50 +99,6 @@ impl<'tcx> JsonRenderer<'tcx> {
             })
             .unwrap_or_default()
     }
-
-    fn get_trait_items(&mut self) -> Vec<(types::Id, types::Item)> {
-        Rc::clone(&self.cache)
-            .traits
-            .iter()
-            .filter_map(|(&id, trait_item)| {
-                // only need to synthesize items for external traits
-                if !id.is_local() {
-                    let trait_item = &trait_item.trait_;
-                    trait_item.items.clone().into_iter().for_each(|i| self.item(i).unwrap());
-                    let item_id = from_item_id(id.into(), self.tcx);
-                    Some((
-                        item_id.clone(),
-                        types::Item {
-                            id: item_id,
-                            crate_id: id.krate.as_u32(),
-                            name: self
-                                .cache
-                                .paths
-                                .get(&id)
-                                .unwrap_or_else(|| {
-                                    self.cache
-                                        .external_paths
-                                        .get(&id)
-                                        .expect("Trait should either be in local or external paths")
-                                })
-                                .0
-                                .last()
-                                .map(|s| s.to_string()),
-                            visibility: types::Visibility::Public,
-                            inner: types::ItemEnum::Trait(trait_item.clone().into_tcx(self.tcx)),
-                            span: None,
-                            docs: Default::default(),
-                            links: Default::default(),
-                            attrs: Default::default(),
-                            deprecation: Default::default(),
-                        },
-                    ))
-                } else {
-                    None
-                }
-            })
-            .collect()
-    }
 }
 
 impl<'tcx> FormatRenderer<'tcx> for JsonRenderer<'tcx> {
@@ -157,12 +115,16 @@ impl<'tcx> FormatRenderer<'tcx> for JsonRenderer<'tcx> {
         tcx: TyCtxt<'tcx>,
     ) -> Result<(Self, clean::Crate), Error> {
         debug!("Initializing json renderer");
+
+        let (krate, imported_items) = import_finder::get_imports(krate);
+
         Ok((
             JsonRenderer {
                 tcx,
                 index: Rc::new(RefCell::new(FxHashMap::default())),
                 out_path: options.output,
                 cache: Rc::new(cache),
+                imported_items,
             },
             krate,
         ))
@@ -176,7 +138,9 @@ impl<'tcx> FormatRenderer<'tcx> for JsonRenderer<'tcx> {
     /// the hashmap because certain items (traits and types) need to have their mappings for trait
     /// implementations filled out before they're inserted.
     fn item(&mut self, item: clean::Item) -> Result<(), Error> {
-        trace!("rendering {} {:?}", item.type_(), item.name);
+        let item_type = item.type_();
+        let item_name = item.name;
+        trace!("rendering {} {:?}", item_type, item_name);
 
         // Flatten items that recursively store other items. We include orphaned items from
         // stripped modules and etc that are otherwise reachable.
@@ -207,17 +171,19 @@ impl<'tcx> FormatRenderer<'tcx> for JsonRenderer<'tcx> {
                     u.impls = self.get_impls(item_id.expect_def_id());
                     false
                 }
+                types::ItemEnum::Primitive(ref mut p) => {
+                    p.impls = self.get_impls(item_id.expect_def_id());
+                    false
+                }
 
-                types::ItemEnum::Method(_)
+                types::ItemEnum::Function(_)
                 | types::ItemEnum::Module(_)
-                | types::ItemEnum::AssocConst { .. }
-                | types::ItemEnum::AssocType { .. }
-                | types::ItemEnum::PrimitiveType(_) => true,
-                types::ItemEnum::ExternCrate { .. }
                 | types::ItemEnum::Import(_)
+                | types::ItemEnum::AssocConst { .. }
+                | types::ItemEnum::AssocType { .. } => true,
+                types::ItemEnum::ExternCrate { .. }
                 | types::ItemEnum::StructField(_)
                 | types::ItemEnum::Variant(_)
-                | types::ItemEnum::Function(_)
                 | types::ItemEnum::TraitAlias(_)
                 | types::ItemEnum::Impl(_)
                 | types::ItemEnum::Typedef(_)
@@ -245,6 +211,7 @@ impl<'tcx> FormatRenderer<'tcx> for JsonRenderer<'tcx> {
             }
         }
 
+        trace!("done rendering {} {:?}", item_type, item_name);
         Ok(())
     }
 
@@ -255,14 +222,16 @@ impl<'tcx> FormatRenderer<'tcx> for JsonRenderer<'tcx> {
     fn after_krate(&mut self) -> Result<(), Error> {
         debug!("Done with crate");
 
+        debug!("Adding Primitive impls");
         for primitive in Rc::clone(&self.cache).primitive_locations.values() {
             self.get_impls(*primitive);
         }
 
         let e = ExternalCrate { crate_num: LOCAL_CRATE };
 
-        let mut index = (*self.index).clone().into_inner();
-        index.extend(self.get_trait_items());
+        let index = (*self.index).clone().into_inner();
+
+        debug!("Constructing Output");
         // This needs to be the default HashMap for compatibility with the public interface for
         // rustdoc-json-types
         #[allow(rustc::default_hash_types)]
@@ -274,10 +243,9 @@ impl<'tcx> FormatRenderer<'tcx> for JsonRenderer<'tcx> {
             paths: self
                 .cache
                 .paths
-                .clone()
-                .into_iter()
-                .chain(self.cache.external_paths.clone().into_iter())
-                .map(|(k, (path, kind))| {
+                .iter()
+                .chain(&self.cache.external_paths)
+                .map(|(&k, &(ref path, kind))| {
                     (
                         from_item_id(k.into(), self.tcx),
                         types::ItemSummary {

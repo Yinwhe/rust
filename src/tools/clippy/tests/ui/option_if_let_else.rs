@@ -208,4 +208,34 @@ fn main() {
 
     let _ = pattern_to_vec("hello world");
     let _ = complex_subpat();
+
+    // issue #8492
+    let _ = match s {
+        Some(string) => string.len(),
+        None => 1,
+    };
+    let _ = match Some(10) {
+        Some(a) => a + 1,
+        None => 5,
+    };
+
+    let res: Result<i32, i32> = Ok(5);
+    let _ = match res {
+        Ok(a) => a + 1,
+        _ => 1,
+    };
+    let _ = match res {
+        Err(_) => 1,
+        Ok(a) => a + 1,
+    };
+    let _ = if let Ok(a) = res { a + 1 } else { 5 };
+}
+
+#[allow(dead_code)]
+fn issue9742() -> Option<&'static str> {
+    // should not lint because of guards
+    match Some("foo  ") {
+        Some(name) if name.starts_with("foo") => Some(name.trim()),
+        _ => None,
+    }
 }

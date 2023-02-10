@@ -89,7 +89,7 @@ use crate::deriving::generic::ty::*;
 use crate::deriving::generic::*;
 use crate::deriving::pathvec_std;
 
-use rustc_ast::{ExprKind, MetaItem, Mutability};
+use rustc_ast::{AttrVec, ExprKind, MetaItem, Mutability};
 use rustc_expand::base::{Annotatable, ExtCtxt};
 use rustc_span::symbol::{sym, Ident, Symbol};
 use rustc_span::Span;
@@ -100,6 +100,7 @@ pub fn expand_deriving_rustc_encodable(
     mitem: &MetaItem,
     item: &Annotatable,
     push: &mut dyn FnMut(Annotatable),
+    is_const: bool,
 ) {
     let krate = sym::rustc_serialize;
     let typaram = sym::__S;
@@ -107,8 +108,9 @@ pub fn expand_deriving_rustc_encodable(
     let trait_def = TraitDef {
         span,
         path: Path::new_(vec![krate, sym::Encodable], vec![], PathKind::Global),
+        skip_path_as_bound: false,
+        needs_copy_as_bound_if_packed: true,
         additional_bounds: Vec::new(),
-        generics: Bounds::empty(),
         supports_unions: false,
         methods: vec![MethodDef {
             name: sym::encode,
@@ -131,13 +133,14 @@ pub fn expand_deriving_rustc_encodable(
                 ],
                 PathKind::Std,
             )),
-            attributes: Vec::new(),
-            unify_fieldless_variants: false,
+            attributes: AttrVec::new(),
+            fieldless_variants_strategy: FieldlessVariantsStrategy::Default,
             combine_substructure: combine_substructure(Box::new(|a, b, c| {
                 encodable_substructure(a, b, c, krate)
             })),
         }],
         associated_types: Vec::new(),
+        is_const,
     };
 
     trait_def.expand(cx, mitem, item, push)
@@ -162,8 +165,8 @@ fn encodable_substructure(
         ],
     ));
 
-    match *substr.fields {
-        Struct(_, ref fields) => {
+    match substr.fields {
+        Struct(_, fields) => {
             let fn_emit_struct_field_path =
                 cx.def_site_path(&[sym::rustc_serialize, sym::Encoder, sym::emit_struct_field]);
             let mut stmts = Vec::new();
@@ -222,7 +225,7 @@ fn encodable_substructure(
             BlockOrExpr::new_expr(expr)
         }
 
-        EnumMatching(idx, _, variant, ref fields) => {
+        EnumMatching(idx, _, variant, fields) => {
             // We're not generating an AST that the borrow checker is expecting,
             // so we need to generate a unique local variable to take the
             // mutable loan out on, otherwise we get conflicts which don't
@@ -272,7 +275,7 @@ fn encodable_substructure(
                 vec![
                     blkencoder,
                     name,
-                    cx.expr_usize(trait_span, idx),
+                    cx.expr_usize(trait_span, *idx),
                     cx.expr_usize(trait_span, fields.len()),
                     blk,
                 ],

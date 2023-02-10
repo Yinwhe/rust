@@ -15,11 +15,12 @@
 
 #![doc(html_root_url = "https://doc.rust-lang.org/nightly/nightly-rustc/")]
 #![feature(array_windows)]
-#![feature(let_else)]
 #![feature(if_let_guard)]
 #![feature(negative_impls)]
 #![feature(min_specialization)]
 #![feature(rustc_attrs)]
+#![deny(rustc::untranslatable_diagnostic)]
+#![deny(rustc::diagnostic_outside_of_impl)]
 
 #[macro_use]
 extern crate rustc_macros;
@@ -74,15 +75,13 @@ use md5::Md5;
 use sha1::Sha1;
 use sha2::Sha256;
 
-use tracing::debug;
-
 #[cfg(test)]
 mod tests;
 
-// Per-session global variables: this struct is stored in thread-local storage
-// in such a way that it is accessible without any kind of handle to all
-// threads within the compilation session, but is not accessible outside the
-// session.
+/// Per-session global variables: this struct is stored in thread-local storage
+/// in such a way that it is accessible without any kind of handle to all
+/// threads within the compilation session, but is not accessible outside the
+/// session.
 pub struct SessionGlobals {
     symbol_interner: symbol::Interner,
     span_interner: Lock<span_encoding::SpanInterner>,
@@ -218,9 +217,7 @@ impl RealFileName {
     pub fn local_path(&self) -> Option<&Path> {
         match self {
             RealFileName::LocalPath(p) => Some(p),
-            RealFileName::Remapped { local_path: p, virtual_name: _ } => {
-                p.as_ref().map(PathBuf::as_path)
-            }
+            RealFileName::Remapped { local_path, virtual_name: _ } => local_path.as_deref(),
         }
     }
 
@@ -241,7 +238,7 @@ impl RealFileName {
     pub fn remapped_path_if_available(&self) -> &Path {
         match self {
             RealFileName::LocalPath(p)
-            | RealFileName::Remapped { local_path: _, virtual_name: p } => &p,
+            | RealFileName::Remapped { local_path: _, virtual_name: p } => p,
         }
     }
 
@@ -262,6 +259,10 @@ impl RealFileName {
             FileNameDisplayPreference::Remapped => {
                 self.remapped_path_if_available().to_string_lossy()
             }
+            FileNameDisplayPreference::Short => self
+                .local_path_if_available()
+                .file_name()
+                .map_or_else(|| "".into(), |f| f.to_string_lossy()),
         }
     }
 }
@@ -299,8 +300,15 @@ impl From<PathBuf> for FileName {
 
 #[derive(Clone, Copy, Eq, PartialEq, Hash, Debug)]
 pub enum FileNameDisplayPreference {
+    /// Display the path after the application of rewrite rules provided via `--remap-path-prefix`.
+    /// This is appropriate for paths that get embedded into files produced by the compiler.
     Remapped,
+    /// Display the path before the application of rewrite rules provided via `--remap-path-prefix`.
+    /// This is appropriate for use in user-facing output (such as diagnostics).
     Local,
+    /// Display only the filename, as a way to reduce the verbosity of the output.
+    /// This is appropriate for use in user-facing output (such as diagnostics).
+    Short,
 }
 
 pub struct FileNameDisplay<'a> {
@@ -321,7 +329,7 @@ impl fmt::Display for FileNameDisplay<'_> {
             ProcMacroSourceCode(_) => write!(fmt, "<proc-macro source code>"),
             CfgSpec(_) => write!(fmt, "<cfgspec>"),
             CliCrateAttr(_) => write!(fmt, "<crate attribute>"),
-            Custom(ref s) => write!(fmt, "<{}>", s),
+            Custom(ref s) => write!(fmt, "<{s}>"),
             DocTest(ref path, _) => write!(fmt, "{}", path.display()),
             InlineAsm(_) => write!(fmt, "<inline asm>"),
         }
@@ -358,8 +366,8 @@ impl FileName {
         FileNameDisplay { inner: self, display_pref: FileNameDisplayPreference::Remapped }
     }
 
-    // This may include transient local filesystem information.
-    // Must not be embedded in build outputs.
+    /// This may include transient local filesystem information.
+    /// Must not be embedded in build outputs.
     pub fn prefer_local(&self) -> FileNameDisplay<'_> {
         FileNameDisplay { inner: self, display_pref: FileNameDisplayPreference::Local }
     }
@@ -490,6 +498,10 @@ impl SpanData {
     pub fn is_dummy(self) -> bool {
         self.lo.0 == 0 && self.hi.0 == 0
     }
+    #[inline]
+    pub fn is_visible(self, sm: &SourceMap) -> bool {
+        !self.is_dummy() && sm.is_span_accessible(self.span())
+    }
     /// Returns `true` if `self` fully encloses `other`.
     pub fn contains(self, other: Self) -> bool {
         self.lo <= other.lo && other.hi <= self.hi
@@ -533,9 +545,6 @@ impl Span {
         self.data().with_hi(hi)
     }
     #[inline]
-    pub fn ctxt(self) -> SyntaxContext {
-        self.data_untracked().ctxt
-    }
     pub fn eq_ctxt(self, other: Span) -> bool {
         self.data_untracked().ctxt == other.data_untracked().ctxt
     }
@@ -558,10 +567,28 @@ impl Span {
         self.data_untracked().is_dummy()
     }
 
-    /// Returns `true` if this span comes from a macro or desugaring.
+    #[inline]
+    pub fn is_visible(self, sm: &SourceMap) -> bool {
+        self.data_untracked().is_visible(sm)
+    }
+
+    /// Returns `true` if this span comes from any kind of macro, desugaring or inlining.
     #[inline]
     pub fn from_expansion(self) -> bool {
         self.ctxt() != SyntaxContext::root()
+    }
+
+    /// Returns `true` if `span` originates in a macro's expansion where debuginfo should be
+    /// collapsed.
+    pub fn in_macro_expansion_with_collapse_debuginfo(self) -> bool {
+        let outer_expn = self.ctxt().outer_expn_data();
+        matches!(outer_expn.kind, ExpnKind::Macro(..)) && outer_expn.collapse_debuginfo
+    }
+
+    /// Returns `true` if this span comes from MIR inlining.
+    pub fn is_inlined(self) -> bool {
+        let outer_expn = self.ctxt().outer_expn_data();
+        matches!(outer_expn.kind, ExpnKind::Inlined)
     }
 
     /// Returns `true` if `span` originates in a derive-macro's expansion.
@@ -662,29 +689,39 @@ impl Span {
         Some(self)
     }
 
+    /// Like `find_ancestor_inside`, but specifically for when spans might not
+    /// overlaps. Take care when using this, and prefer `find_ancestor_inside`
+    /// when you know that the spans are nested (modulo macro expansion).
+    pub fn find_ancestor_in_same_ctxt(mut self, other: Span) -> Option<Span> {
+        while !Span::eq_ctxt(self, other) {
+            self = self.parent_callsite()?;
+        }
+        Some(self)
+    }
+
     /// Edition of the crate from which this span came.
     pub fn edition(self) -> edition::Edition {
         self.ctxt().edition()
     }
 
     #[inline]
-    pub fn rust_2015(self) -> bool {
-        self.edition() == edition::Edition::Edition2015
+    pub fn is_rust_2015(self) -> bool {
+        self.edition().is_rust_2015()
     }
 
     #[inline]
     pub fn rust_2018(self) -> bool {
-        self.edition() >= edition::Edition::Edition2018
+        self.edition().rust_2018()
     }
 
     #[inline]
     pub fn rust_2021(self) -> bool {
-        self.edition() >= edition::Edition::Edition2021
+        self.edition().rust_2021()
     }
 
     #[inline]
     pub fn rust_2024(self) -> bool {
-        self.edition() >= edition::Edition::Edition2024
+        self.edition().rust_2024()
     }
 
     /// Returns the source callee.
@@ -730,7 +767,7 @@ impl Span {
 
     /// Checks if a span is "internal" to a macro in which `unsafe`
     /// can be used without triggering the `unsafe_code` lint.
-    //  (that is, a macro marked with `#[allow_internal_unsafe]`).
+    /// (that is, a macro marked with `#[allow_internal_unsafe]`).
     pub fn allows_unsafe(self) -> bool {
         self.ctxt().outer_expn_data().allow_internal_unsafe
     }
@@ -758,6 +795,9 @@ impl Span {
     }
 
     /// Returns a `Span` that would enclose both `self` and `end`.
+    ///
+    /// Note that this can also be used to extend the span "backwards":
+    /// `start.to(end)` and `end.to(start)` return the same `Span`.
     ///
     /// ```text
     ///     ____             ___
@@ -1034,7 +1074,7 @@ impl NonNarrowChar {
             0 => NonNarrowChar::ZeroWidth(pos),
             2 => NonNarrowChar::Wide(pos),
             4 => NonNarrowChar::Tab(pos),
-            _ => panic!("width {} given for non-narrow character", width),
+            _ => panic!("width {width} given for non-narrow character"),
         }
     }
 
@@ -1094,10 +1134,8 @@ pub enum ExternalSource {
     Unneeded,
     Foreign {
         kind: ExternalSourceKind,
-        /// This SourceFile's byte-offset within the source_map of its original crate.
-        original_start_pos: BytePos,
-        /// The end of this SourceFile within the source_map of its original crate.
-        original_end_pos: BytePos,
+        /// Index of the file inside metadata.
+        metadata_index: u32,
     },
 }
 
@@ -1353,7 +1391,7 @@ impl<S: Encoder> Encodable<S> for SourceFile {
                     4 => {
                         raw_diffs = Vec::with_capacity(bytes_per_diff * num_diffs);
                         for diff in diff_iter {
-                            raw_diffs.extend_from_slice(&(diff.0 as u32).to_le_bytes());
+                            raw_diffs.extend_from_slice(&(diff.0).to_le_bytes());
                         }
                     }
                     _ => unreachable!(),
@@ -1616,11 +1654,7 @@ impl SourceFile {
     /// number. If the source_file is empty or the position is located before the
     /// first line, `None` is returned.
     pub fn lookup_line(&self, pos: BytePos) -> Option<usize> {
-        self.lines(|lines| match lines.binary_search(&pos) {
-            Ok(idx) => Some(idx),
-            Err(0) => None,
-            Err(idx) => Some(idx - 1),
-        })
+        self.lines(|lines| lines.partition_point(|x| x <= &pos).checked_sub(1))
     }
 
     pub fn line_bounds(&self, line_index: usize) -> Range<BytePos> {

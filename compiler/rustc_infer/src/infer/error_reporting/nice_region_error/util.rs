@@ -65,7 +65,7 @@ pub fn find_param_with_region<'tcx>(
 
     let owner_id = hir.body_owner(body_id);
     let fn_decl = hir.fn_decl_by_hir_id(owner_id).unwrap();
-    let poly_fn_sig = tcx.fn_sig(id);
+    let poly_fn_sig = tcx.fn_sig(id).subst_identity();
 
     let fn_sig = tcx.liberate_late_bound_regions(id, poly_fn_sig);
     let body = hir.body(body_id);
@@ -130,7 +130,7 @@ impl<'a, 'tcx> NiceRegionError<'a, 'tcx> {
             let ret_ty = fn_ty.fn_sig(self.tcx()).output();
             let span = hir_sig.decl.output.span();
             let future_output = if hir_sig.header.is_async() {
-                ret_ty.map_bound(|ty| self.infcx.get_impl_future_output_ty(ty)).transpose()
+                ret_ty.map_bound(|ty| self.cx.get_impl_future_output_ty(ty)).transpose()
             } else {
                 None
             };
@@ -149,6 +149,8 @@ impl<'a, 'tcx> NiceRegionError<'a, 'tcx> {
         region: ty::BoundRegionKind,
     ) -> bool {
         let late_bound_regions = self.tcx().collect_referenced_late_bound_regions(&ty);
+        // We are only checking is any region meets the condition so order doesn't matter
+        #[allow(rustc::potential_query_instability)]
         late_bound_regions.iter().any(|r| *r == region)
     }
 

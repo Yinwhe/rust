@@ -28,7 +28,6 @@ use std::cell::RefCell;
 use std::ffi::CString;
 
 use std::iter;
-use tracing::debug;
 
 pub mod mapgen;
 
@@ -38,7 +37,7 @@ const VAR_ALIGN_BYTES: usize = 8;
 
 /// A context object for maintaining all state needed by the coverageinfo module.
 pub struct CrateCoverageContext<'ll, 'tcx> {
-    // Coverage data for each instrumented function identified by DefId.
+    /// Coverage data for each instrumented function identified by DefId.
     pub(crate) function_coverage_map: RefCell<FxHashMap<Instance<'tcx>, FunctionCoverage<'tcx>>>,
     pub(crate) pgo_func_name_var_map: RefCell<FxHashMap<Instance<'tcx>, &'ll llvm::Value>>,
 }

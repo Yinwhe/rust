@@ -22,9 +22,9 @@ use crate::slice::{self, SliceIndex};
 
 pub mod pattern;
 
-#[unstable(feature = "str_internals", issue = "none")]
-#[allow(missing_docs)]
-pub mod lossy;
+mod lossy;
+#[unstable(feature = "utf8_chunks", issue = "99543")]
+pub use lossy::{Utf8Chunk, Utf8Chunks};
 
 #[stable(feature = "rust1", since = "1.0.0")]
 pub use converts::{from_utf8, from_utf8_unchecked};
@@ -91,10 +91,12 @@ const fn slice_error_fail(s: &str, begin: usize, end: usize) -> ! {
     }
 }
 
+#[track_caller]
 const fn slice_error_fail_ct(_: &str, _: usize, _: usize) -> ! {
     panic!("failed to slice string");
 }
 
+#[track_caller]
 fn slice_error_fail_rt(s: &str, begin: usize, end: usize) -> ! {
     const MAX_DISPLAY_LENGTH: usize = 256;
     let trunc_len = s.floor_char_boundary(MAX_DISPLAY_LENGTH);
@@ -366,7 +368,7 @@ impl str {
     #[inline(always)]
     pub unsafe fn as_bytes_mut(&mut self) -> &mut [u8] {
         // SAFETY: the cast from `&str` to `&[u8]` is safe since `str`
-        // has the same layout as `&[u8]` (only libstd can make this guarantee).
+        // has the same layout as `&[u8]` (only std can make this guarantee).
         // The pointer dereference is safe since it comes from a mutable reference which
         // is guaranteed to be valid for writes.
         unsafe { &mut *(self as *mut str as *mut [u8]) }
@@ -394,7 +396,7 @@ impl str {
     #[stable(feature = "rust1", since = "1.0.0")]
     #[rustc_const_stable(feature = "rustc_str_as_ptr", since = "1.32.0")]
     #[must_use]
-    #[inline]
+    #[inline(always)]
     pub const fn as_ptr(&self) -> *const u8 {
         self as *const str as *const u8
     }
@@ -409,7 +411,7 @@ impl str {
     /// modified in a way that it remains valid UTF-8.
     #[stable(feature = "str_as_mut_ptr", since = "1.36.0")]
     #[must_use]
-    #[inline]
+    #[inline(always)]
     pub fn as_mut_ptr(&mut self) -> *mut u8 {
         self as *mut str as *mut u8
     }
@@ -900,6 +902,12 @@ impl str {
     ///
     /// assert_eq!(None, iter.next());
     /// ```
+    ///
+    /// If the string is empty or all whitespace, the iterator yields no string slices:
+    /// ```
+    /// assert_eq!("".split_whitespace().next(), None);
+    /// assert_eq!("   ".split_whitespace().next(), None);
+    /// ```
     #[must_use = "this returns the split string as an iterator, \
                   without modifying the original"]
     #[stable(feature = "split_whitespace", since = "1.1.0")]
@@ -944,6 +952,12 @@ impl str {
     ///
     /// assert_eq!(None, iter.next());
     /// ```
+    ///
+    /// If the string is empty or all ASCII whitespace, the iterator yields no string slices:
+    /// ```
+    /// assert_eq!("".split_ascii_whitespace().next(), None);
+    /// assert_eq!("   ".split_ascii_whitespace().next(), None);
+    /// ```
     #[must_use = "this returns the split string as an iterator, \
                   without modifying the original"]
     #[stable(feature = "split_ascii_whitespace", since = "1.34.0")]
@@ -956,8 +970,10 @@ impl str {
 
     /// An iterator over the lines of a string, as string slices.
     ///
-    /// Lines are ended with either a newline (`\n`) or a carriage return with
-    /// a line feed (`\r\n`).
+    /// Lines are split at line endings that are either newlines (`\n`) or
+    /// sequences of a carriage return followed by a line feed (`\r\n`).
+    ///
+    /// Line terminators are not included in the lines returned by the iterator.
     ///
     /// The final line ending is optional. A string that ends with a final line
     /// ending will return the same lines as an otherwise identical string
@@ -2638,3 +2654,6 @@ impl_fn_for_zst! {
         unsafe { from_utf8_unchecked(bytes) }
     };
 }
+
+#[stable(feature = "rust1", since = "1.0.0")]
+impl !crate::error::Error for &str {}

@@ -2,7 +2,7 @@
 
 use std::sync::Arc;
 
-use hir_expand::{name::Name, AstId, ExpandResult, HirFileId, MacroCallId, MacroDefKind};
+use hir_expand::{name::Name, AstId, ExpandResult, HirFileId, InFile, MacroCallId, MacroDefKind};
 use smallvec::SmallVec;
 use syntax::ast;
 
@@ -12,7 +12,12 @@ use crate::{
     db::DefDatabase,
     intern::Interned,
     item_tree::{self, AssocItem, FnFlags, ItemTree, ItemTreeId, ModItem, Param, TreeId},
-    nameres::{attr_resolution::ResolvedAttr, proc_macro::ProcMacroKind, DefMap},
+    nameres::{
+        attr_resolution::ResolvedAttr,
+        diagnostics::DefDiagnostic,
+        proc_macro::{parse_macro_name_and_helper_attrs, ProcMacroKind},
+        DefMap,
+    },
     type_ref::{TraitRef, TypeBound, TypeRef},
     visibility::RawVisibility,
     AssocItemId, AstIdWithPath, ConstId, ConstLoc, FunctionId, FunctionLoc, HasModule, ImplId,
@@ -165,6 +170,7 @@ pub struct TypeAliasData {
     pub type_ref: Option<Interned<TypeRef>>,
     pub visibility: RawVisibility,
     pub is_extern: bool,
+    pub rustc_has_incoherent_inherent_impls: bool,
     /// Bounds restricting the type alias itself (eg. `type Ty: Bound;` in a trait or impl).
     pub bounds: Vec<Interned<TypeBound>>,
 }
@@ -183,11 +189,17 @@ impl TypeAliasData {
             item_tree[typ.visibility].clone()
         };
 
+        let rustc_has_incoherent_inherent_impls = item_tree
+            .attrs(db, loc.container.module(db).krate(), ModItem::from(loc.id.value).into())
+            .by_key("rustc_has_incoherent_inherent_impls")
+            .exists();
+
         Arc::new(TypeAliasData {
             name: typ.name.clone(),
             type_ref: typ.type_ref.clone(),
             visibility,
             is_extern: matches!(loc.container, ItemContainerId::ExternBlockId(_)),
+            rustc_has_incoherent_inherent_impls,
             bounds: typ.bounds.to_vec(),
         })
     }
@@ -199,6 +211,7 @@ pub struct TraitData {
     pub items: Vec<(Name, AssocItemId)>,
     pub is_auto: bool,
     pub is_unsafe: bool,
+    pub rustc_has_incoherent_inherent_impls: bool,
     pub visibility: RawVisibility,
     /// Whether the trait has `#[rust_skip_array_during_method_dispatch]`. `hir_ty` will ignore
     /// method calls to this trait's methods when the receiver is an array and the crate edition is
@@ -210,36 +223,54 @@ pub struct TraitData {
 
 impl TraitData {
     pub(crate) fn trait_data_query(db: &dyn DefDatabase, tr: TraitId) -> Arc<TraitData> {
+        db.trait_data_with_diagnostics(tr).0
+    }
+
+    pub(crate) fn trait_data_with_diagnostics_query(
+        db: &dyn DefDatabase,
+        tr: TraitId,
+    ) -> (Arc<TraitData>, Arc<[DefDiagnostic]>) {
         let tr_loc @ ItemLoc { container: module_id, id: tree_id } = tr.lookup(db);
         let item_tree = tree_id.item_tree(db);
         let tr_def = &item_tree[tree_id.value];
         let _cx = stdx::panic_context::enter(format!(
-            "trait_data_query({:?} -> {:?} -> {:?})",
-            tr, tr_loc, tr_def
+            "trait_data_query({tr:?} -> {tr_loc:?} -> {tr_def:?})"
         ));
         let name = tr_def.name.clone();
         let is_auto = tr_def.is_auto;
         let is_unsafe = tr_def.is_unsafe;
         let visibility = item_tree[tr_def.visibility].clone();
-        let skip_array_during_method_dispatch = item_tree
-            .attrs(db, module_id.krate(), ModItem::from(tree_id.value).into())
-            .by_key("rustc_skip_array_during_method_dispatch")
-            .exists();
-
-        let mut collector =
-            AssocItemCollector::new(db, module_id, tree_id.file_id(), ItemContainerId::TraitId(tr));
-        collector.collect(&item_tree, tree_id.tree_id(), &tr_def.items);
-        let (items, attribute_calls) = collector.finish();
-
-        Arc::new(TraitData {
-            name,
-            attribute_calls,
-            items,
-            is_auto,
-            is_unsafe,
-            visibility,
-            skip_array_during_method_dispatch,
-        })
+        let attrs = item_tree.attrs(db, module_id.krate(), ModItem::from(tree_id.value).into());
+        let skip_array_during_method_dispatch =
+            attrs.by_key("rustc_skip_array_during_method_dispatch").exists();
+        let rustc_has_incoherent_inherent_impls =
+            attrs.by_key("rustc_has_incoherent_inherent_impls").exists();
+        let (items, attribute_calls, diagnostics) = match &tr_def.items {
+            Some(items) => {
+                let mut collector = AssocItemCollector::new(
+                    db,
+                    module_id,
+                    tree_id.file_id(),
+                    ItemContainerId::TraitId(tr),
+                );
+                collector.collect(&item_tree, tree_id.tree_id(), items);
+                collector.finish()
+            }
+            None => Default::default(),
+        };
+        (
+            Arc::new(TraitData {
+                name,
+                attribute_calls,
+                items,
+                is_auto,
+                is_unsafe,
+                visibility,
+                skip_array_during_method_dispatch,
+                rustc_has_incoherent_inherent_impls,
+            }),
+            diagnostics.into(),
+        )
     }
 
     pub fn associated_types(&self) -> impl Iterator<Item = TypeAliasId> + '_ {
@@ -280,7 +311,14 @@ pub struct ImplData {
 
 impl ImplData {
     pub(crate) fn impl_data_query(db: &dyn DefDatabase, id: ImplId) -> Arc<ImplData> {
-        let _p = profile::span("impl_data_query");
+        db.impl_data_with_diagnostics(id).0
+    }
+
+    pub(crate) fn impl_data_with_diagnostics_query(
+        db: &dyn DefDatabase,
+        id: ImplId,
+    ) -> (Arc<ImplData>, Arc<[DefDiagnostic]>) {
+        let _p = profile::span("impl_data_with_diagnostics_query");
         let ItemLoc { container: module_id, id: tree_id } = id.lookup(db);
 
         let item_tree = tree_id.item_tree(db);
@@ -293,10 +331,13 @@ impl ImplData {
             AssocItemCollector::new(db, module_id, tree_id.file_id(), ItemContainerId::ImplId(id));
         collector.collect(&item_tree, tree_id.tree_id(), &impl_def.items);
 
-        let (items, attribute_calls) = collector.finish();
+        let (items, attribute_calls, diagnostics) = collector.finish();
         let items = items.into_iter().map(|(_, item)| item).collect();
 
-        Arc::new(ImplData { target_trait, self_ty, items, is_negative, attribute_calls })
+        (
+            Arc::new(ImplData { target_trait, self_ty, items, is_negative, attribute_calls }),
+            diagnostics.into(),
+        )
     }
 
     pub fn attribute_calls(&self) -> impl Iterator<Item = (AstId<ast::Item>, MacroCallId)> + '_ {
@@ -308,6 +349,10 @@ impl ImplData {
 pub struct Macro2Data {
     pub name: Name,
     pub visibility: RawVisibility,
+    // It's a bit wasteful as currently this is only for builtin `Default` derive macro, but macro2
+    // are rarely used in practice so I think it's okay for now.
+    /// Derive helpers, if this is a derive rustc_builtin_macro
+    pub helpers: Option<Box<[Name]>>,
 }
 
 impl Macro2Data {
@@ -316,9 +361,18 @@ impl Macro2Data {
         let item_tree = loc.id.item_tree(db);
         let makro = &item_tree[loc.id.value];
 
+        let helpers = item_tree
+            .attrs(db, loc.container.krate(), ModItem::from(loc.id.value).into())
+            .by_key("rustc_builtin_macro")
+            .tt_values()
+            .next()
+            .and_then(|attr| parse_macro_name_and_helper_attrs(&attr.token_trees))
+            .map(|(_, helpers)| helpers);
+
         Arc::new(Macro2Data {
             name: makro.name.clone(),
             visibility: item_tree[makro.visibility].clone(),
+            helpers,
         })
     }
 }
@@ -437,6 +491,7 @@ struct AssocItemCollector<'a> {
     db: &'a dyn DefDatabase,
     module_id: ModuleId,
     def_map: Arc<DefMap>,
+    inactive_diagnostics: Vec<DefDiagnostic>,
     container: ItemContainerId,
     expander: Expander,
 
@@ -459,15 +514,21 @@ impl<'a> AssocItemCollector<'a> {
             expander: Expander::new(db, file_id, module_id),
             items: Vec::new(),
             attr_calls: Vec::new(),
+            inactive_diagnostics: Vec::new(),
         }
     }
 
     fn finish(
         self,
-    ) -> (Vec<(Name, AssocItemId)>, Option<Box<Vec<(AstId<ast::Item>, MacroCallId)>>>) {
+    ) -> (
+        Vec<(Name, AssocItemId)>,
+        Option<Box<Vec<(AstId<ast::Item>, MacroCallId)>>>,
+        Vec<DefDiagnostic>,
+    ) {
         (
             self.items,
             if self.attr_calls.is_empty() { None } else { Some(Box::new(self.attr_calls)) },
+            self.inactive_diagnostics,
         )
     }
 
@@ -479,12 +540,18 @@ impl<'a> AssocItemCollector<'a> {
         'items: for &item in assoc_items {
             let attrs = item_tree.attrs(self.db, self.module_id.krate, ModItem::from(item).into());
             if !attrs.is_cfg_enabled(self.expander.cfg_options()) {
+                self.inactive_diagnostics.push(DefDiagnostic::unconfigured_code(
+                    self.module_id.local_id,
+                    InFile::new(self.expander.current_file_id(), item.ast_id(item_tree).upcast()),
+                    attrs.cfg().unwrap(),
+                    self.expander.cfg_options().clone(),
+                ));
                 continue;
             }
 
             'attrs: for attr in &*attrs {
                 let ast_id =
-                    AstId::new(self.expander.current_file_id(), item.ast_id(&item_tree).upcast());
+                    AstId::new(self.expander.current_file_id(), item.ast_id(item_tree).upcast());
                 let ast_id_with_path = AstIdWithPath { path: (*attr.path).clone(), ast_id };
 
                 if let Ok(ResolvedAttr::Macro(call_id)) = self.def_map.resolve_attr_macro(
@@ -551,10 +618,8 @@ impl<'a> AssocItemCollector<'a> {
 
                         let ast_id_map = self.db.ast_id_map(self.expander.current_file_id());
                         let call = ast_id_map.get(call.ast_id).to_node(&root);
-                        let _cx = stdx::panic_context::enter(format!(
-                            "collect_items MacroCall: {}",
-                            call
-                        ));
+                        let _cx =
+                            stdx::panic_context::enter(format!("collect_items MacroCall: {call}"));
                         let res = self.expander.enter_expand::<ast::MacroItems>(self.db, call);
 
                         if let Ok(ExpandResult { value: Some((mark, _)), .. }) = res {

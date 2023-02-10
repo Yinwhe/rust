@@ -1,10 +1,11 @@
 use clippy_utils::diagnostics::span_lint_and_sugg;
 use clippy_utils::is_wild;
 use clippy_utils::source::snippet_with_applicability;
+use clippy_utils::span_contains_comment;
 use rustc_ast::{Attribute, LitKind};
 use rustc_errors::Applicability;
 use rustc_hir::{Arm, BorrowKind, Expr, ExprKind, Guard, Pat};
-use rustc_lint::LateContext;
+use rustc_lint::{LateContext, LintContext};
 use rustc_middle::ty;
 use rustc_span::source_map::Spanned;
 
@@ -76,6 +77,7 @@ where
         >,
 {
     if_chain! {
+        if !span_contains_comment(cx.sess().source_map(), expr.span);
         if iter.len() >= 2;
         if cx.typeck_results().expr_ty(expr).is_bool();
         if let Some((_, last_pat_opt, last_expr, _)) = iter.next_back();
@@ -110,7 +112,7 @@ where
                     .join(" | ")
             };
             let pat_and_guard = if let Some(Guard::If(g)) = first_guard {
-                format!("{} if {}", pat, snippet_with_applicability(cx, g.span, "..", &mut applicability))
+                format!("{pat} if {}", snippet_with_applicability(cx, g.span, "..", &mut applicability))
             } else {
                 pat
             };
@@ -129,10 +131,9 @@ where
                 &format!("{} expression looks like `matches!` macro", if is_if_let { "if let .. else" } else { "match" }),
                 "try this",
                 format!(
-                    "{}matches!({}, {})",
+                    "{}matches!({}, {pat_and_guard})",
                     if b0 { "" } else { "!" },
                     snippet_with_applicability(cx, ex_new.span, "..", &mut applicability),
-                    pat_and_guard,
                 ),
                 applicability,
             );
