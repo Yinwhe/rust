@@ -346,6 +346,7 @@ fn run_compiler(
                 return early_exit();
             }
 
+            // # NOTE HERE
             if sess.opts.ruf_analysis {
                 my_plugin(queries);
                 return early_exit();
