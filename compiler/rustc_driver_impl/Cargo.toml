@@ -30,6 +30,7 @@ rustc_interface = { path = "../rustc_interface" }
 rustc_ast = { path = "../rustc_ast" }
 rustc_span = { path = "../rustc_span" }
 rustc_hir_analysis = { path = "../rustc_hir_analysis" }
+rustc_expand = { path = "../rustc_expand" }
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"

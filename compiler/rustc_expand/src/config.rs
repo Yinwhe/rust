@@ -11,7 +11,7 @@ use rustc_ast::tokenstream::{DelimSpan, Spacing};
 use rustc_ast::tokenstream::{LazyAttrTokenStream, TokenTree};
 use rustc_ast::NodeId;
 use rustc_ast::{
-    self as ast, AttrKind, AttrStyle, Attribute, HasAttrs, HasTokens, MacArgs, MetaItem,
+    self as ast, AttrKind, AttrStyle, Attribute, HasAttrs, HasTokens, MetaItem,
     MetaItemKind, NestedMetaItem,
 };
 use rustc_attr as attr;
@@ -27,6 +27,8 @@ use rustc_session::Session;
 use rustc_span::edition::{Edition, ALL_EDITIONS};
 use rustc_span::symbol::{sym, Symbol};
 use rustc_span::{Span, DUMMY_SP};
+use ast::AttrArgs;
+
 
 /// A folder that strips out items that do not belong in the current configuration.
 pub struct StripUnconfigured<'a> {
@@ -39,6 +41,7 @@ pub struct StripUnconfigured<'a> {
     pub lint_node_id: NodeId,
 }
 
+// # NOTE HERE
 pub struct ConfigFeatures<'a> {
     pub sess: &'a Session,
     pub origin_cfg_attrs_datas: Vec<(Vec<MetaItem>, Attribute)>,
@@ -94,7 +97,8 @@ impl<'a> ConfigFeatures<'a> {
             }
 
             if let AttrKind::Normal(item) = &attr.kind {
-                if let MacArgs::Delimited(_, _, tokens) = &item.item.args {
+                if let AttrArgs::Delimited(delimargs) = &item.item.args {
+                    let tokens = &delimargs.tokens;
                     for token in tokens.trees() {
                         if let TokenTree::Token(token, _) = token {
                             if let Some((ident, _)) = token.ident() {
@@ -167,7 +171,7 @@ impl<'a> ConfigFeatures<'a> {
         let req = match &cond.kind {
             MetaItemKind::Word => cond.ident().expect("rustc resolve feature fails").as_str().to_string(),
             MetaItemKind::NameValue(lit) => {
-                format!("{} = {}", cond.ident().expect("rustc resolve feature fails").as_str(), lit.token_lit.symbol.as_str(),)
+                format!("{} = {}", cond.ident().expect("rustc resolve feature fails").as_str(), lit.symbol.as_str(),)
             }
             MetaItemKind::List(nmetas) => {
                 let mut req = String::new();
@@ -199,7 +203,7 @@ impl<'a> ConfigFeatures<'a> {
         let req = match &cond.kind {
             MetaItemKind::Word => vec![left_val],
             MetaItemKind::NameValue(lit) => {
-                vec![format!("{} = {}", &left_val, lit.token_lit.symbol.as_str())]
+                vec![format!("{} = {}", &left_val, lit.symbol.as_str())]
             }
             MetaItemKind::List(nmetas) => {
                 let mut nest_conds = vec![];
@@ -253,7 +257,7 @@ impl<'a> ConfigFeatures<'a> {
         attr: &Attribute,
         (item, item_span): (ast::AttrItem, Span),
     ) -> Attribute {
-        let orig_tokens = attr.tokens().to_tokenstream();
+        let orig_tokens = attr.tokens();
 
         // We are taking an attribute of the form `#[cfg_attr(pred, attr)]`
         // and producing an attribute of the form `#[attr]`. We
@@ -269,27 +273,33 @@ impl<'a> ConfigFeatures<'a> {
         };
         let pound_span = pound_token.span;
 
-        let mut trees = vec![(AttrAnnotatedTokenTree::Token(pound_token), Spacing::Alone)];
+        let mut trees = vec![AttrTokenTree::Token(pound_token, Spacing::Alone)];
         if attr.style == AttrStyle::Inner {
             // For inner attributes, we do the same thing for the `!` in `#![some_attr]`
             let TokenTree::Token(bang_token @ Token { kind: TokenKind::Not, .. }, _) = orig_trees.next().unwrap() else {
                 panic!("Bad tokens for attribute {:?}", attr);
             };
-            trees.push((AttrAnnotatedTokenTree::Token(bang_token), Spacing::Alone));
+            trees.push(AttrTokenTree::Token(bang_token, Spacing::Alone));
         }
         // We don't really have a good span to use for the synthesized `[]`
         // in `#[attr]`, so just use the span of the `#` token.
-        let bracket_group = AttrAnnotatedTokenTree::Delimited(
+        let bracket_group = AttrTokenTree::Delimited(
             DelimSpan::from_single(pound_span),
             Delimiter::Bracket,
             item.tokens
                 .as_ref()
                 .unwrap_or_else(|| panic!("Missing tokens for {:?}", item))
-                .create_token_stream(),
+                .to_attr_token_stream(),
         );
-        trees.push((bracket_group, Spacing::Alone));
-        let tokens = Some(LazyTokenStream::new(AttrAnnotatedTokenStream::new(trees)));
-        let attr = attr::mk_attr_from_item(item, tokens, attr.style, item_span);
+        trees.push(bracket_group);
+        let tokens = Some(LazyAttrTokenStream::new(AttrTokenStream::new(trees)));
+        let attr = attr::mk_attr_from_item(
+            &self.sess.parse_sess.attr_id_generator,
+            item,
+            tokens,
+            attr.style,
+            item_span,
+        );
         if attr.has_name(sym::crate_type) {
             self.sess.parse_sess.buffer_lint(
                 rustc_lint_defs::builtin::DEPRECATED_CFG_ATTR_CRATE_TYPE_NAME,

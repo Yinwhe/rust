@@ -113,6 +113,8 @@ impl<'tcx> Queries<'tcx> {
         }
     }
 
+    // # NOTE HERE
+    // fn -> pub fn
     pub fn session(&self) -> &Lrc<Session> {
         &self.compiler.sess
     }

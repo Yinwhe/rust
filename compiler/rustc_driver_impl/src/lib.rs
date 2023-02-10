@@ -42,6 +42,7 @@ use rustc_session::{early_error, early_error_no_abort, early_warn};
 use rustc_span::source_map::{FileLoader, FileName};
 use rustc_span::symbol::sym;
 use rustc_target::json::ToJson;
+use rustc_expand::config::ConfigFeatures;
 
 use std::cmp::max;
 use std::env;
@@ -311,6 +312,12 @@ fn run_compiler(
                 return early_exit();
             }
 
+            // # NOTE HERE
+            if sess.opts.ruf_analysis {
+                my_plugin(queries);
+                return early_exit();
+            }
+            
             {
                 let plugins = queries.register_plugins()?;
                 let (_, lint_store) = &*plugins.borrow();
@@ -393,6 +400,25 @@ fn run_compiler(
 
         Ok(())
     })
+}
+
+fn my_plugin(queries: &Queries<'_>) {
+    println!("||| Nightly Feature Analysis Start |||");
+
+    let krate = queries.parse().unwrap().steal();
+    let mut config_features = ConfigFeatures {
+        sess: queries.session(),
+        origin_cfg_attrs_datas: Vec::new(),
+        visulized_cfg_attrs_datas: Vec::new(),
+        processed_cfg_attrs_datas: Vec::new(),
+    };
+
+    config_features.analysis_krate_attrs(krate.attrs.to_vec());
+    
+    config_features.print_visulized();
+    println!("-------------------------------------");
+    config_features.print_processed();
+    println!("||| Nightly Feature Analysis End |||");
 }
 
 // Extract output directory and file from matches.
