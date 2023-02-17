@@ -196,12 +196,18 @@ impl<'a> ConfigFeatures<'a> {
     fn process_cfg_cond(&self, cond: &MetaItem) -> Vec<String> {
         let left_val = cond.ident().expect("rustc resolve feature fails").as_str().to_string();
 
+        // cases to be ignored
         if left_val.starts_with("target") {
+            return vec![];
+        }
+        if left_val == "unix" || left_val == "windows" {
             return vec![];
         }
 
         let req = match &cond.kind {
-            MetaItemKind::Word => vec![left_val],
+            MetaItemKind::Word => {
+                vec![left_val]
+            }
             MetaItemKind::NameValue(lit) => {
                 vec![format!("{} = {}", &left_val, lit.symbol.as_str())]
             }
@@ -240,7 +246,7 @@ impl<'a> ConfigFeatures<'a> {
                     if conds.len() == 1 {
                         vec![format!("not({})", conds.join(","))]
                     } else {
-                        vec![format!("not(any{})", conds.join(","))]
+                        vec![format!("not(any({}))", conds.join(","))]
                     }
 
                 } else {
