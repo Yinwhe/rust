@@ -200,7 +200,7 @@ impl<'a> ConfigFeatures<'a> {
         if left_val.starts_with("target") {
             return vec![];
         }
-        if left_val == "unix" || left_val == "windows" {
+        if left_val == "unix" || left_val == "windows" || left_val == "nightly" || left_val == "RUSTC_WITH_SPECIALIZATION" {
             return vec![];
         }
 
