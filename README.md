@@ -3,8 +3,10 @@ This rapo is modified for research purpose: it can **extract and analysis** unst
 
 ## How to build
 For *nix system:
-```
+```Shell
+# Build Setup (Choose "compiler" when meeting setup option)
 ./x.py setup
+# Compile (When met "error: failed to download llvm from ci", follow the instructions given)
 ./x.py build
 ```
 
